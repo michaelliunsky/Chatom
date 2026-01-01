@@ -629,7 +629,7 @@ chatrooms.forEach(function(room) {
 });
 </script>
 <div align="center">
-    Copyright © 2025 By <a href="https://www.mkliu.top/"><strong>michaelliunsky</strong></a> & <strong>Yuer6327</strong>
+    Copyright © 2025-2026 By <a href="https://www.mkliu.top/"><strong>michaelliunsky</strong></a> & <strong>Yuer6327</strong>
 </div>
 </body>
 </html>
