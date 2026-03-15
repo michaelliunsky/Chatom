@@ -158,12 +158,12 @@ $chatrooms = getChatrooms();
   --red:  #cc2200;
   --sans: 'Inter', 'Noto Sans SC', sans-serif;
   --mono: 'Menlo', 'Monaco', 'Consolas', monospace;
-  --sw: 224px;
+  --sw: 260px;
 }
 
-html, body { height: 100%; background: var(--c0); color: var(--c7); font-family: var(--sans); font-size: 15px; overflow: hidden; -webkit-font-smoothing: antialiased; }
+html, body { height: 100dvh; background: var(--c0); color: var(--c7); font-family: var(--sans); font-size: 15px; overflow: hidden; -webkit-font-smoothing: antialiased; }
 
-.layout { display: grid; grid-template-columns: var(--sw) 1fr; height: 100vh; }
+.layout { display: grid; grid-template-columns: var(--sw) 1fr; height: 100dvh; }
 
 /* Sidebar */
 .side {
@@ -220,7 +220,23 @@ html, body { height: 100%; background: var(--c0); color: var(--c7); font-family:
   color: var(--c4);
   border-top: 1px solid var(--c3);
   flex-shrink: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
+
+.side-close {
+  display: none;
+  background: none;
+  border: none;
+  font-size: 18px;
+  line-height: 1;
+  color: var(--c5);
+  cursor: pointer;
+  padding: 0 2px;
+  transition: color .15s;
+}
+.side-close:hover { color: var(--c7); }
 
 .rooms-label {
   font-size: 11px;
@@ -492,17 +508,26 @@ html, body { height: 100%; background: var(--c0); color: var(--c7); font-family:
 @keyframes tin  { from { opacity:0; transform:translateY(6px); } }
 @keyframes tout { to   { opacity:0; transform:translateY(6px); } }
 
+.side-overlay {
+  display: none;
+  position: fixed; inset: 0;
+  z-index: 59;
+  background: rgba(0,0,0,.25);
+}
+
 /* Mobile */
 @media (max-width: 600px) {
   .layout { grid-template-columns: 1fr; }
   .side { display:none; position:fixed; inset:0 auto 0 0; width:var(--sw); z-index:60; box-shadow:4px 0 16px rgba(0,0,0,.1); }
   .side.open { display:flex; }
+  .side.open ~ .side-overlay { display:block; }
+  .side-close { display:block; }
   #menuBtn { display:flex !important; }
 }
 
 /* Desktop — bump everything up */
 @media (min-width: 601px) {
-  :root { --sw: 240px; }
+  :root { --sw: 280px; }
   .site-name   { font-size: 15px; }
   .nick-label  { font-size: 13px; }
   .nick-input  { font-size: 15px; padding: 8px 10px; }
@@ -562,7 +587,10 @@ html, body { height: 100%; background: var(--c0); color: var(--c7); font-family:
 
   <aside class="side" id="side">
     <div class="side-top">
-      <div class="site-name"><?= htmlspecialchars($title) ?></div>
+      <div style="display:flex;align-items:center;justify-content:space-between">
+        <div class="site-name"><?= htmlspecialchars($title) ?></div>
+        <button class="side-close" onclick="closeSide()">×</button>
+      </div>
       <div class="nick-row">
         <div class="nick-label">昵称</div>
         <input id="txtUser" class="nick-input" type="text" maxlength="50"
@@ -587,6 +615,7 @@ html, body { height: 100%; background: var(--c0); color: var(--c7); font-family:
       © 2025-2026 <a href="https://www.mkliu.top/" style="color:var(--c5);text-decoration:none">michaelliunsky</a> & Yuer6327
     </div>
   </aside>
+  <div class="side-overlay" id="sideOverlay" onclick="closeSide()"></div>
 
   <section class="main">
     <div class="topbar">
@@ -745,6 +774,8 @@ function clearMsgs(){
   document.getElementById('msgs').innerHTML='<div class="no-msgs" id="es">暂无消息</div>';
   seen={};
 }
+
+function closeSide(){document.getElementById('side').classList.remove('open');}
 
 var ta=document.getElementById('txtContent');
 function resize(){ta.style.height='auto';ta.style.height=Math.min(ta.scrollHeight,108)+'px';}
