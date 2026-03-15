@@ -1,635 +1,764 @@
 <?php
-// 使用PHP做的单页面在线聊天。
-// 20250123 BY MKLIU
-// 基本功能：
-// 1. 多人聊天
-// 2. 多房间
-// 3. 传输信息加密，基于base64+字符替换实现
-// 4. 基于长连接读取（ngnix使用PHP sleep有问题）
-// 5. 支持昵称自定义，并使用浏览器保存。
-// 6. 需要在程序目录创建chat_data文件夹，用来存储历史聊天数据
-// 7. 支持新建房间，自动生成密码
-// 8. 支持密码保护房间
-// 9. 在config.php中设置网站标题和logo
-
+// 单页面在线聊天
+// 20250123 20260315 BY MKLIU
 include 'config.php';
 date_default_timezone_set("PRC");
 error_reporting(E_ALL & ~E_NOTICE);
 set_time_limit(30);
 
-$room = $_REQUEST['room'] ?? 'default';
-$type = $_REQUEST['type'] ?? 'enter';
-$type = strtolower($type);
+$room = preg_replace('/[^a-zA-Z0-9_\-]/', '', $_REQUEST['room'] ?? 'default');
+if ($room === '') $room = 'default';
+$type = strtolower($_REQUEST['type'] ?? 'enter');
 
-// 获取所有聊天室
 function getChatrooms() {
     $files = glob('./chat_data/*.txt');
-    $chatrooms = [];
-    foreach ($files as $file) {
-        $filename = basename($file, '.txt');
-        $chatrooms[] = $filename;
-    }
-    return $chatrooms;
-}
-
-// 生成新房间
-function newRoom($room, $custompassword = null) {
-    $room_file = './chat_data/' . $room . '.txt';
-    $key_list = array_merge(range(48, 57), range(65, 90), range(97, 122), [43, 47, 61]);
-    $key1_list = $key_list;
-    shuffle($key1_list);
-
-    if ($room !== 'default' && !$custompassword) {
-        $custompassword = generateRandomPassword();
-    }
-
-    $room_data = [
-        'name'   => $room,
-        'encode' => array_combine($key_list, $key1_list),
-        'list'   => [],
-        'time'   => date('Y-m-d H:i:s'),
-        'password' => $room === 'default' ? null : password_hash($custompassword, PASSWORD_DEFAULT),
-    ];
-    file_put_contents($room_file, json_encode($room_data));
-    return $custompassword;
-}
-
-// 检测密码是否正确
-function checkPassword() {
-    if ($_SERVER['REQUEST_METHOD'] === 'POST') {
-        $password = $_POST['password'] ?? '';
-        $roominput = $_POST['room'] ?? '';
-        $room_file = './chat_data/' . $roominput . '.txt';
-        if (file_exists($room_file)) {
-            $room_data = json_decode(file_get_contents($room_file), true);
-            $correctPassword = $room_data['password']; // 获取正确的密码哈希
-            if (password_verify($password, $correctPassword)) {
-                return true;
-            } else {
-                echo '<script>
-                    alert("密码错误，请重试。");
-                    window.location.reload();
-                </script>';
-                return false;
-            }
-        } else {
-            echo '<script>
-                alert("房间不存在，请重试。");
-                window.location.reload();
-            </script>';
-            return false;
-        }
-    } else {
-        echo '<div class="overlay">
-    <div class="form-container">
-        <form id="passwordForm" method="post" action="">
-            <h2>请输入房间号和密码</h2>
-            <label for="room">房间号：</label>
-            <input type="text" name="room" id="userRoom" required>
-            <br>
-            <label for="password">密码：</label>
-            <input type="password" name="password" id="userPassword" required>
-            <br>
-            <input type="submit" value="提交">
-        </form>
-    </div>
-</div>
-<style>
-.overlay {
-    position: fixed;
-    top: 0;
-    left: 0;
-    width: 100%;
-    height: 100%;
-    background: linear-gradient(135deg, #FFD700, #1E90FF); /* 黄蓝渐变色 */
-    display: flex;
-    justify-content: center;
-    align-items: center;
-}
-.form-container {
-    background: #fff;
-    padding: 20px;
-    border-radius: 8px;
-    box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
-    max-width: 400px;
-    width: 100%;
-}
-h2 {
-    text-align: center;
-    margin-bottom: 20px;
-    color: #444;
-}
-label {
-    display: block;
-    margin-bottom: 5px;
-    font-weight: bold;
-    color: #333;
-}
-input[type="text"], input[type="password"] {
-    width: calc(100% - 20px);
-    padding: 10px;
-    margin: 10px 0;
-    border: 1px solid #ccc;
-    border-radius: 4px;
-    font-size: 16px;
-    box-sizing: border-box;
-    box-shadow: inset 2px 2px 5px rgba(0, 0, 0, 0.1), inset -2px -2px 5px rgba(255, 255, 255, 0.7);
-    background: #f9f9f9;
-}
-input[type="submit"] {
-    background-color: #007BFF;
-    color: #fff;
-    padding: 10px 20px;
-    border: none;
-    border-radius: 4px;
-    font-size: 16px;
-    cursor: pointer;
-    transition: background-color 0.3s ease;
-    box-shadow: 2px 2px 5px rgba(0, 0, 0, 0.1), -2px -2px 5px rgba(255, 255, 255, 0.7);
-    width: 100%;
-}
-input[type="submit"]:hover {
-    background-color: #0056b3;
-}
-</style>
-';
-        exit;
-    }
+    $rooms = [];
+    foreach ($files as $f) $rooms[] = basename($f, '.txt');
+    return $rooms;
 }
 
 function generateRandomPassword() {
     $chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
-    $passwordgen = '';
-    for ($i = 0; $i < 8; $i++) {
-        $passwordgen .= $chars[rand(0, strlen($chars) - 1)];
-    }
-    return $passwordgen;
+    $pw = '';
+    for ($i = 0; $i < 8; $i++) $pw .= $chars[rand(0, strlen($chars) - 1)];
+    return $pw;
 }
 
-//20250123 BY MKLIU
-// 获取消息列表
+function newRoom($room, $custompassword = null) {
+    $room_file = './chat_data/' . $room . '.txt';
+    $key_list  = array_merge(range(48, 57), range(65, 90), range(97, 122), [43, 47, 61]);
+    $key1_list = $key_list;
+    shuffle($key1_list);
+    if ($room !== 'default' && !$custompassword) $custompassword = generateRandomPassword();
+    $data = [
+        'name'     => $room,
+        'encode'   => array_combine($key_list, $key1_list),
+        'list'     => [],
+        'time'     => date('Y-m-d H:i:s'),
+        'password' => ($room === 'default') ? null : password_hash($custompassword, PASSWORD_DEFAULT),
+    ];
+    file_put_contents($room_file, json_encode($data));
+    return $custompassword;
+}
+
 function getMsg($room, $last_id) {
     $room_file = './chat_data/' . $room . '.txt';
-    $msg_list = [];
-
-    $room_data = json_decode(file_get_contents($room_file), true);
-    $list = $room_data['list'];
-
-    // 清除一周前消息
-    $cur_list = [];
-    $del_time = date('Y-m-d H:i:s', time() - 604800);
-    foreach ($list as $r) {
-        if ($r['time'] > $del_time) {
-            $cur_list[] = $r;
-        }
+    $data      = json_decode(file_get_contents($room_file), true);
+    $list      = $data['list'];
+    $del_time  = date('Y-m-d H:i:s', time() - 604800);
+    $cur = array_values(array_filter($list, fn($r) => $r['time'] > $del_time));
+    if (count($cur) !== count($list)) {
+        $data['list'] = $cur;
+        file_put_contents($room_file, json_encode($data));
     }
-
-    if (count($cur_list) != count($list) && count($list) > 0) {
-        $room_data['list'] = $cur_list;
-        file_put_contents($room_file, json_encode($room_data));
-    }
-
-    // 查找最新消息
-    foreach ($list as $r) {
-        if ($r['id'] > $last_id) {
-            $msg_list[] = $r;
-        }
-    }
-
-    return $msg_list;
+    return array_values(array_filter($cur, fn($r) => $r['id'] > $last_id));
 }
 
-$room_file = './chat_data/' . $room . '.txt';
-
-switch ($type) {
-    case 'enter':   // 进入房间
-        $authenticated = false;
-        
-        // 如果房间名称为 'default'，直接通过身份验证
-        if ($room === 'default') {
-            $authenticated = true;
-        } else {
-            if (checkPassword()) {
-                $authenticated = true;
-            }
-        }
-    
-        if ($authenticated) {
-            // 密码正确或房间为 'default'，继续执行聊天功能
-            break;
-        } else {
-            // 如果验证失败，直接退出
-            exit;
-        }
-        break;
-
-    // 进入房间，显示聊天窗口
-    case 'get':     // 获取消息
-        $last_id = $_REQUEST['last_id'];
-        $msg_list = [];
-
-        if (strpos($_SERVER['SERVER_SOFTWARE'], 'nginx') !== false) {
-            $msg_list = getMsg($room, $last_id);
-        } else {
-            // nginx 使用sleep将会把整个网站卡死
-            for ($i = 0; $i < 20; $i++) {
-                $msg_list = getMsg($room, $last_id);
-                
-                if (!empty($msg_list)) {
-                    break;
-                }
-    
-                usleep(500000);
-            }
-        }
-
-        echo json_encode(['result' => 'ok', 'list' => $msg_list]);
-
-        break;
-    case 'send':    // 发送消息
-        $item = [
-            'id' => round(microtime(true) * 1000),
-            'user' => $_REQUEST['user'],
-            'content' => $_REQUEST['content'],
-            'time' => date('Y-m-d H:i:s'),
-        ];
-        $room_data = json_decode(file_get_contents($room_file), true);
-        $room_data['list'][] = $item;
-        file_put_contents($room_file, json_encode($room_data));
-        echo json_encode(['result' => 'ok']);
-        break;
-    case 'new':     // 新建房间
-        mt_srand();
-        $room = strtoupper(md5(uniqid(mt_rand(), true)));
-        $room = substr($room, 0, 10);
-        $passwordinput = $_REQUEST['password'] ?? null;
-        $generatedPassword = newRoom($room, $passwordinput);
-        echo '<script>alert("房间号是：' . $room . '，房间密码是：' . $generatedPassword . '，请保存好。"); window.location.href="index.php?room=' . $room . '";</script>';
+if ($type === 'get') {
+    $last_id  = (int)($_REQUEST['last_id'] ?? -1);
+    $room_file_get = './chat_data/' . $room . '.txt';
+    if (!file_exists($room_file_get)) {
+        header('Content-Type: application/json');
+        echo json_encode(['result' => 'ok', 'list' => []]);
         exit;
-        break;
-    default:
-        echo 'ERROR:no type!';
-        break;
-}
-
-if ($type != 'enter') {
+    }
+    $msg_list = [];
+    if (strpos($_SERVER['SERVER_SOFTWARE'] ?? '', 'nginx') !== false) {
+        $msg_list = getMsg($room, $last_id);
+    } else {
+        for ($i = 0; $i < 20; $i++) {
+            $msg_list = getMsg($room, $last_id);
+            if (!empty($msg_list)) break;
+            usleep(500000);
+        }
+    }
+    header('Content-Type: application/json');
+    echo json_encode(['result' => 'ok', 'list' => $msg_list]);
     exit;
 }
 
-if (!file_exists($room_file)) {
-    if ($room == 'default') {
-        newRoom($room);
-    } else {
-        echo 'ERROR:room not exists!';
+if ($type === 'send') {
+    $room_file = './chat_data/' . $room . '.txt';
+    if (!file_exists($room_file)) {
+        header('Content-Type: application/json');
+        echo json_encode(['result' => 'error', 'msg' => 'room not found']);
         exit;
+    }
+    $item = [
+        'id'      => round(microtime(true) * 1000),
+        'user'    => htmlspecialchars(substr($_REQUEST['user'] ?? 'anon', 0, 50)),
+        'content' => $_REQUEST['content'] ?? '',
+        'time'    => date('Y-m-d H:i:s'),
+    ];
+    $data           = json_decode(file_get_contents($room_file), true);
+    $data['list'][] = $item;
+    file_put_contents($room_file, json_encode($data));
+    header('Content-Type: application/json');
+    echo json_encode(['result' => 'ok']);
+    exit;
+}
+
+if ($type === 'new') {
+    mt_srand();
+    $newroom  = strtoupper(substr(md5(uniqid(mt_rand(), true)), 0, 10));
+    $pw_input = $_POST['password'] ?? null;
+    $gen_pw   = newRoom($newroom, $pw_input ?: null);
+    header('Content-Type: application/json');
+    echo json_encode(['result' => 'ok', 'room' => $newroom, 'password' => $gen_pw]);
+    exit;
+}
+
+// Page render
+$room_file   = './chat_data/' . $room . '.txt';
+$requireAuth = false;
+$authError   = '';
+
+if ($room === 'default') {
+    if (!file_exists($room_file)) newRoom($room);
+} else {
+    if (!file_exists($room_file)) { header('Location: index.php'); exit; }
+    if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['auth_submit'])) {
+        $input_pw      = $_POST['password'] ?? '';
+        $room_data_tmp = json_decode(file_get_contents($room_file), true);
+        if (!password_verify($input_pw, $room_data_tmp['password'])) {
+            $requireAuth = true;
+            $authError   = '密码错误';
+        }
+    } else {
+        $requireAuth = true;
     }
 }
 
 $room_data = json_decode(file_get_contents($room_file), true);
 unset($room_data['list']);
 
-$user = 'User' . str_pad((time() % 99 + 1), 2, '0', STR_PAD_LEFT);
-
-$chatrooms = getChatrooms(); // 获取所有聊天室
-
+$user      = 'User' . str_pad((time() % 99 + 1), 2, '0', STR_PAD_LEFT);
+$chatrooms = getChatrooms();
 ?>
-
-<!--html页面-->
-<!--20250123 BY MKLIU-->
 <!DOCTYPE html>
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
-<meta http-equiv="X-UA-Compatible" content="IE=edge">
-<meta name="renderer" content="webkit">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title><?php echo $title; ?></title>
-<link rel="icon" href="<?php echo $logoUrl; ?>" type="image/x-icon">
-<link href="https://lib.baomitu.com/normalize/latest/normalize.min.css" rel="stylesheet">
+<title><?= htmlspecialchars($title) ?></title>
+<link rel="icon" href="<?= htmlspecialchars($logoUrl) ?>" type="image/x-icon">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=Noto+Sans+SC:wght@400;500;600&display=swap" rel="stylesheet">
 <style>
-/* css style */
-body {
-    padding: 0 10px;
-}
-.divMain {
-    font-size: 14px;
-    line-height: 2;
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+:root {
+  --c0: #ffffff;
+  --c1: #f7f7f5;
+  --c2: #efefed;
+  --c3: #e2e2e0;
+  --c4: #c7c7c4;
+  --c5: #888885;
+  --c6: #444442;
+  --c7: #111110;
+  --red:  #cc2200;
+  --sans: 'Inter', 'Noto Sans SC', sans-serif;
+  --mono: 'Menlo', 'Monaco', 'Consolas', monospace;
+  --sw: 224px;
 }
 
-#divList span {
-    color: gray;
-}
-body {
-    margin: 0;
-    padding: 0;
-    font-family: 'Arial', sans-serif;
-    background-color: #f4f4f9;
-    color: #333;
+html, body { height: 100%; background: var(--c0); color: var(--c7); font-family: var(--sans); font-size: 15px; overflow: hidden; -webkit-font-smoothing: antialiased; }
+
+.layout { display: grid; grid-template-columns: var(--sw) 1fr; height: 100vh; }
+
+/* Sidebar */
+.side {
+  border-right: 1px solid var(--c3);
+  display: flex; flex-direction: column; overflow: hidden;
+  background: var(--c1);
 }
 
-/* 主标题样式 */
-h1 {
-    text-align: center;
-    font-size: 2.5em;
-    color: #444;
-    margin-top: 0px;
+.side-top {
+  padding: 14px 14px 12px;
+  border-bottom: 1px solid var(--c3);
+  flex-shrink: 0;
 }
 
-/* 在线聊天室列表 */
-#chatroomList {
-    max-width: 800px;
-    margin: 20px auto;
-    background: #ffffff;
-    padding: 20px;
-    border-radius: 8px;
-    box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
-    line-height: 1.6;
+.site-name {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--c7);
+  letter-spacing: -.2px;
 }
 
-/* 主体容器 */
-.divMain {
-    max-width: 800px;
-    margin: 20px auto;
-    background: #ffffff;
-    padding: 20px;
-    border-radius: 8px;
-    box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
-    line-height: 1.6;
+.nick-row { margin-top: 10px; }
+
+.nick-label {
+  font-size: 11px;
+  color: var(--c5);
+  margin-bottom: 4px;
 }
 
-/* 输入框样式 */
-input[type="text"], input[type="password"] {
-    width: calc(100% - 120px);
-    padding: 10px;
-    margin: 10px 0;
-    border: 1px solid #ccc;
-    border-radius: 4px;
-    font-size: 16px;
-    box-sizing: border-box;
+.nick-input {
+  width: 100%;
+  border: 1px solid var(--c3);
+  border-radius: 5px;
+  padding: 6px 8px;
+  font-size: 13px;
+  font-family: var(--sans);
+  color: var(--c7);
+  background: var(--c0);
+  outline: none;
+  transition: border-color .15s;
+}
+.nick-input:focus { border-color: var(--c6); }
+
+.side-rooms {
+  flex: 1; overflow-y: auto; min-height: 0;
+  padding: 8px 8px 10px;
+}
+.side-rooms::-webkit-scrollbar { width: 3px; }
+.side-rooms::-webkit-scrollbar-thumb { background: var(--c3); }
+
+.side-footer {
+  padding: 8px 14px 10px;
+  font-size: 11px;
+  color: var(--c4);
+  border-top: 1px solid var(--c3);
+  flex-shrink: 0;
 }
 
-/* 按钮样式 */
-button {
-    background-color: #007BFF;
-    color: #fff;
-    padding: 10px 20px;
-    border: none;
-    border-radius: 4px;
-    font-size: 16px;
-    cursor: pointer;
-    transition: background-color 0.3s ease;
+.rooms-label {
+  font-size: 11px;
+  color: var(--c5);
+  padding: 4px 6px 6px;
 }
 
-button:hover {
-    background-color: #0056b3;
+.room-link {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 6px 8px;
+  border-radius: 5px;
+  font-size: 13px;
+  color: var(--c6);
+  text-decoration: none;
+  transition: background .1s;
+  margin-bottom: 1px;
+  font-family: var(--mono);
+  letter-spacing: -.3px;
+}
+.room-link:hover { background: var(--c2); color: var(--c7); }
+.room-link.on { background: var(--c7); color: var(--c0); }
+
+.room-lock { font-size: 11px; opacity: .5; }
+
+.add-room {
+  width: 100%;
+  margin-top: 8px;
+  padding: 6px 8px;
+  border: 1px solid var(--c3);
+  border-radius: 5px;
+  background: transparent;
+  font-size: 12px;
+  color: var(--c5);
+  cursor: pointer;
+  text-align: left;
+  transition: color .15s, border-color .15s;
+  font-family: var(--sans);
+}
+.add-room:hover { color: var(--c7); border-color: var(--c6); }
+
+/* Main */
+.main { display: flex; flex-direction: column; overflow: hidden; background: var(--c0); }
+
+.topbar {
+  height: 48px; padding: 0 16px;
+  display: flex; align-items: center; justify-content: space-between;
+  border-bottom: 1px solid var(--c3);
+  flex-shrink: 0;
 }
 
-/* 链接样式 */
-a {
-    color: #007BFF;
-    text-decoration: none;
-    font-size: 14px;
-    margin-left: 10px;
+.topbar-room { font-size: 13px; font-weight: 600; font-family: var(--mono); }
+.topbar-meta { font-size: 11px; color: var(--c5); margin-left: 8px; font-weight: 400; font-family: var(--sans); }
+
+.clear-btn {
+  padding: 4px 10px;
+  border: 1px solid var(--c3);
+  border-radius: 4px;
+  background: transparent;
+  font-size: 12px;
+  color: var(--c5);
+  cursor: pointer;
+  transition: color .15s, border-color .15s;
+}
+.clear-btn:hover { color: var(--c7); border-color: var(--c6); }
+
+/* Messages */
+.msgs {
+  flex: 1; overflow-y: auto;
+  display: flex; flex-direction: column-reverse;
+  padding: 12px 16px;
+}
+.msgs::-webkit-scrollbar { width: 4px; }
+.msgs::-webkit-scrollbar-thumb { background: var(--c3); border-radius: 2px; }
+
+.msg {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 0 10px;
+  padding: 5px 0;
+  animation: up .15s ease-out;
+}
+@keyframes up { from { opacity:0; transform:translateY(4px); } }
+
+.msg-who {
+  font-size: 12px; font-weight: 600;
+  color: var(--c7);
+  white-space: nowrap;
+  padding-top: 1px;
+  min-width: 80px;
+  max-width: 120px;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
-a:hover {
-    text-decoration: underline;
+.msg-right { min-width: 0; }
+
+.msg-time {
+  font-size: 11px;
+  color: var(--c4);
+  font-family: var(--mono);
+  margin-bottom: 2px;
 }
 
-/* 消息列表 */
-#divList {
-    margin-top: 20px;
-    padding: 10px;
-    border-top: 1px solid #ddd;
-    background-color: rgba(249, 249, 249, 0.8); /* 浅灰色半透明背景 */
+.msg-text {
+  font-size: 13.5px;
+  line-height: 1.6;
+  color: var(--c6);
+  word-break: break-word;
 }
 
-#divList div {
-    margin-bottom: 10px;
-    padding: 8px;
-    background: #ffffff; /* 消息背景为白色 */
-    border: 1px solid #e3e3e3;
-    border-radius: 4px;
+.no-msgs {
+  display: flex; align-items: center; justify-content: center;
+  flex: 1;
+  font-size: 13px;
+  color: var(--c4);
 }
 
-#divList span {
-    color: #888;
-    font-size: 12px;
-    margin-right: 10px;
+/* Input */
+.input-area {
+  padding: 10px 14px 14px;
+  border-top: 1px solid var(--c3);
+  flex-shrink: 0;
 }
 
-/* 消息用户名加粗 */
-#divList b {
-    font-weight: bold;
-    color: #333;
+.input-row {
+  display: flex; gap: 8px; align-items: flex-end;
 }
 
-/* 响应式支持 */
+#txtContent {
+  flex: 1;
+  border: 1px solid var(--c3);
+  border-radius: 6px;
+  padding: 8px 11px;
+  font-size: 14px;
+  font-family: var(--sans);
+  color: var(--c7);
+  background: var(--c0);
+  outline: none;
+  resize: none;
+  min-height: 36px;
+  max-height: 108px;
+  line-height: 1.5;
+  transition: border-color .15s;
+}
+#txtContent:focus { border-color: var(--c6); }
+#txtContent::placeholder { color: var(--c4); }
+
+.send {
+  height: 36px; padding: 0 14px;
+  background: var(--c7);
+  border: none; border-radius: 6px;
+  color: var(--c0);
+  font-size: 13px; font-weight: 500;
+  cursor: pointer;
+  flex-shrink: 0;
+  transition: background .15s;
+}
+.send:hover { background: var(--c6); }
+
+.input-hint { font-size: 11px; color: var(--c4); margin-top: 5px; }
+
+/* Modals */
+.veil {
+  position: fixed; inset: 0;
+  background: rgba(0,0,0,.3);
+  display: flex; align-items: center; justify-content: center;
+  z-index: 80;
+  opacity: 0; pointer-events: none;
+  transition: opacity .18s;
+}
+.veil.on { opacity: 1; pointer-events: all; }
+
+.panel {
+  background: var(--c0);
+  border: 1px solid var(--c3);
+  border-radius: 8px;
+  padding: 24px;
+  width: 100%; max-width: 360px;
+  box-shadow: 0 8px 32px rgba(0,0,0,.12);
+  transform: translateY(6px);
+  transition: transform .18s;
+}
+.veil.on .panel { transform: translateY(0); }
+
+.panel-title { font-size: 15px; font-weight: 600; margin-bottom: 4px; }
+.panel-sub   { font-size: 12px; color: var(--c5); margin-bottom: 18px; line-height: 1.6; }
+
+.field-label { font-size: 11px; color: var(--c5); margin-bottom: 4px; }
+
+.field {
+  width: 100%;
+  border: 1px solid var(--c3);
+  border-radius: 5px;
+  padding: 8px 10px;
+  font-size: 13px;
+  font-family: var(--mono);
+  color: var(--c7);
+  background: var(--c0);
+  outline: none;
+  margin-bottom: 14px;
+  transition: border-color .15s;
+}
+.field:focus { border-color: var(--c6); }
+
+.panel-row { display: flex; gap: 8px; }
+
+.btn-dark {
+  flex: 1; padding: 8px;
+  background: var(--c7); border: none; border-radius: 5px;
+  color: var(--c0); font-size: 13px; font-weight: 500;
+  cursor: pointer; transition: background .15s;
+}
+.btn-dark:hover { background: var(--c6); }
+
+.btn-line {
+  padding: 8px 14px;
+  background: transparent;
+  border: 1px solid var(--c3); border-radius: 5px;
+  color: var(--c5); font-size: 13px;
+  cursor: pointer; transition: color .15s, border-color .15s;
+}
+.btn-line:hover { color: var(--c7); border-color: var(--c6); }
+
+.result-block {
+  background: var(--c1); border: 1px solid var(--c3);
+  border-radius: 5px; padding: 10px 12px; margin-bottom: 16px;
+}
+.result-item {
+  display: flex; justify-content: space-between; align-items: center;
+  padding: 3px 0; gap: 12px;
+}
+.rk { font-size: 11px; color: var(--c5); flex-shrink: 0; }
+.rv { font-size: 13px; font-weight: 600; font-family: var(--mono); color: var(--c7); word-break: break-all; text-align: right; }
+
+/* Auth */
+.auth-wrap {
+  position: fixed; inset: 0;
+  background: var(--c1);
+  display: flex; align-items: center; justify-content: center;
+  z-index: 200;
+}
+
+.auth-box {
+  background: var(--c0);
+  border: 1px solid var(--c3);
+  border-radius: 8px;
+  padding: 28px 26px 24px;
+  width: 100%; max-width: 340px;
+  box-shadow: 0 4px 20px rgba(0,0,0,.07);
+}
+
+.auth-title { font-size: 15px; font-weight: 600; margin-bottom: 4px; }
+.auth-sub   { font-size: 12px; color: var(--c5); margin-bottom: 20px; line-height: 1.6; }
+.auth-err   { font-size: 12px; color: var(--red); margin-bottom: 10px; }
+
+/* Toast */
+.toasts {
+  position: fixed; bottom: 18px; right: 18px;
+  z-index: 999; display: flex; flex-direction: column; gap: 6px; align-items: flex-end;
+}
+.toast {
+  background: var(--c7); color: var(--c0);
+  border-radius: 5px; padding: 8px 14px;
+  font-size: 12px;
+  box-shadow: 0 4px 14px rgba(0,0,0,.15);
+  animation: tin .15s ease-out;
+}
+.toast.err { background: var(--red); }
+@keyframes tin  { from { opacity:0; transform:translateY(6px); } }
+@keyframes tout { to   { opacity:0; transform:translateY(6px); } }
+
+/* Mobile */
 @media (max-width: 600px) {
-    .divMain {
-        padding: 15px;
-    }
+  .layout { grid-template-columns: 1fr; }
+  .side { display:none; position:fixed; inset:0 auto 0 0; width:var(--sw); z-index:60; box-shadow:4px 0 16px rgba(0,0,0,.1); }
+  .side.open { display:flex; }
+  #menuBtn { display:flex !important; }
+}
 
-    input[type="text"] {
-        width: calc(100% - 90px);
-    }
-
-    button {
-        padding: 8px 15px;
-        font-size: 14px;
-    }
+/* Desktop — bump everything up */
+@media (min-width: 601px) {
+  :root { --sw: 240px; }
+  .site-name   { font-size: 15px; }
+  .nick-label  { font-size: 13px; }
+  .nick-input  { font-size: 15px; padding: 8px 10px; }
+  .rooms-label { font-size: 12px; }
+  .room-link   { font-size: 14px; padding: 7px 9px; }
+  .add-room    { font-size: 13px; padding: 7px 9px; }
+  .topbar      { height: 52px; padding: 0 20px; }
+  .topbar-room { font-size: 15px; }
+  .topbar-meta { font-size: 13px; }
+  .clear-btn   { font-size: 13px; padding: 5px 12px; }
+  .msgs        { padding: 16px 20px; }
+  .msg         { padding: 6px 0; gap: 0 12px; }
+  .msg-who     { font-size: 14px; min-width: 90px; max-width: 140px; }
+  .msg-time    { font-size: 12px; }
+  .msg-text    { font-size: 15px; }
+  .no-msgs     { font-size: 14px; }
+  .input-area  { padding: 12px 18px 16px; }
+  #txtContent  { font-size: 15px; padding: 9px 12px; }
+  .send        { font-size: 14px; height: 38px; padding: 0 18px; }
+  .input-hint  { font-size: 12px; }
+  .panel-title { font-size: 16px; }
+  .panel-sub   { font-size: 13px; }
+  .field-label { font-size: 12px; }
+  .field       { font-size: 14px; }
+  .btn-dark, .btn-line { font-size: 14px; padding: 9px 16px; }
+  .auth-title  { font-size: 16px; }
+  .auth-sub    { font-size: 13px; }
+  .auth-err    { font-size: 13px; }
+  .toast       { font-size: 13px; }
 }
 </style>
-
-<script src="https://lib.baomitu.com/jquery/3.4.1/jquery.min.js"></script>
 </head>
 <body>
-    
-<h1><?php echo $title; ?></h1>
-<h2 align="center">在线房间</h2>
-<div id="chatroomList"></div>
-<div class="divMain">
-昵称：<input id="txtUser" type="text" maxlength="50" value="<?=$user?>" />
-<button onclick="$('#divList').html('');">清空</button>
-<br>
-内容：<input id="txtContent" type="text" value="" maxlength="100" style="width: 300px;" />
-<button onclick="sendMsg();">发送</button>
-<br>
-<label for="password">密码：</label>
-<input type="password" id="txtPassword" maxlength="50" />
-<button onclick="createRoom();">新房间</button><p>若密码为空，则将自动生成密码</p>
 
-<hr>
-<div id="divList"></div>
+<?php if ($requireAuth): ?>
+<div class="auth-wrap">
+  <div class="auth-box">
+    <div class="auth-title"><?= htmlspecialchars($room) ?></div>
+    <div class="auth-sub">此房间需要密码。</div>
+    <?php if ($authError): ?>
+      <div class="auth-err"><?= htmlspecialchars($authError) ?></div>
+    <?php endif; ?>
+    <form method="post" action="index.php?room=<?= urlencode($room) ?>">
+      <input type="hidden" name="auth_submit" value="1">
+      <div class="field-label">密码</div>
+      <input type="password" name="password" class="field" autofocus required style="margin-bottom:16px">
+      <div class="panel-row">
+        <a href="index.php" class="btn-line" style="text-decoration:none;text-align:center">返回</a>
+        <button type="submit" class="btn-dark">进入</button>
+      </div>
+    </form>
+  </div>
 </div>
-<!--20250123 BY MKLIU-->
-<!--使用worker获取消息数据，注意ngnix会阻塞整个进程-->
-<script id="worker" type="app/worker">
-    var room = '<?=$room_data['name']?>';
-    var isBusy = false;
-    var lastId = -1;
 
-    var urlBase = '';
-    addEventListener('message', function (evt) {
-        urlBase = evt.data;
-    }, false);
-    setInterval(function(){
-        if (isBusy) return;
-        isBusy = true;
+<?php else: ?>
+<div class="layout">
 
-        let url = new URL( 'index.php?type=get&room=' + room + '&last_id=' + lastId, urlBase );
-        fetch(url)
-        .then(res=>res.json())
-        .then(function(res){
-            isBusy = false;
-            if (res.list.length > 0)
-            {
-                lastId = res.list[res.list.length-1].id;
-            }
-            self.postMessage(res);
-        })
-        .catch(function(err){
-            isBusy = false;
-        });
-    }, 1000);
-</script>
-<script>
-    var blob = new Blob([document.querySelector('#worker').textContent]);
-    var url = window.URL.createObjectURL(blob);
-    var worker = new Worker(url);
+  <aside class="side" id="side">
+    <div class="side-top">
+      <div class="site-name"><?= htmlspecialchars($title) ?></div>
+      <div class="nick-row">
+        <div class="nick-label">昵称</div>
+        <input id="txtUser" class="nick-input" type="text" maxlength="50"
+               value="<?= htmlspecialchars($user) ?>" placeholder="输入昵称">
+      </div>
+    </div>
 
-    worker.onmessage = function (e) {
-        let res = e.data;
-        let html = '';
-        for (let k in res.list)
-        {
-            let r = res.list[k];
-            html = '<div><span>' + r.time + '</span> <b>' + r.user + ':</b>   ' + decodeContent(r.content) + '</div>' + html;
-        }
+    <div class="side-rooms">
+      <div class="rooms-label">房间</div>
+      <?php foreach ($chatrooms as $cr): ?>
+        <a class="room-link <?= ($cr === $room_data['name']) ? 'on' : '' ?>"
+           href="index.php?room=<?= urlencode($cr) ?>">
+          <span><?= htmlspecialchars($cr) ?></span>
+          <?php if ($cr !== 'default'): ?>
+            <span class="room-lock">🔒</span>
+          <?php endif; ?>
+        </a>
+      <?php endforeach; ?>
+      <button class="add-room" onclick="openCreate()">+ 新建房间</button>
+    </div>
+    <div class="side-footer">
+      © 2025-2026 <a href="https://www.mkliu.top/" style="color:var(--c5);text-decoration:none">michaelliunsky</a> & Yuer6327
+    </div>
+  </aside>
 
-        $('#divList').prepend(html);
-    };
+  <section class="main">
+    <div class="topbar">
+      <div style="display:flex;align-items:center;gap:8px">
+        <button class="clear-btn" id="menuBtn" style="display:none"
+                onclick="document.getElementById('side').classList.toggle('open')">☰</button>
+        <span class="topbar-room"><?= htmlspecialchars($room_data['name']) ?></span>
+        <span class="topbar-meta"><?= date('Y-m-d') ?></span>
+      </div>
+      <button class="clear-btn" onclick="clearMsgs()">清空</button>
+    </div>
 
-    worker.postMessage(document.baseURI);
-</script>
+    <div class="msgs" id="msgs">
+      <div class="no-msgs" id="es">暂无消息</div>
+    </div>
 
-<script>
-var room = <?=json_encode($room_data)?>;
-room['decode'] = {};
-for (let k in room.encode)
-{
-    room['decode'][room.encode[k]] = k;
-}
-
-//20250123 BY MKLIU
-// 发送消息
-var lastSendTime = 0;
-function sendMsg()
-{
-    let user = $('#txtUser').val().trim();
-    let content = $('#txtContent').val().trim();
-
-    if (content == '')
-    {
-        return;
-    }
-
-    if (user == '')
-    {
-        alert('昵称不能为空');
-        return;
-    }
-
-    window.localStorage.setItem('r_' + room.name, user);
-    
-    // 限制0.3秒内仅允许发送1条消息
-    let curTime = new Date().getTime();
-    if (curTime - lastSendTime < 300)
-    {
-        return;
-    }
-    lastSendTime = curTime;
-
-    $.ajax({
-        url:'index.php?type=send',
-        data:{room:room.name, user:user, content:encodeContent(content)},
-        type:'POST',
-        dataType:'json',
-        success:function(){
-            $('#txtContent').val('');
-            $('#txtContent').focus();
-        },
-    });
-}
-
-//20250123 BY MKLIU
-// 消息加密
-function encodeContent(content)
-{
-    content = encodeURIComponent(content);
-    content = window.btoa(content);
-
-    let str = '';
-    for (let i=0; i<content.length; i++)
-    {
-        str += String.fromCharCode(room.encode[content.charCodeAt(i)]);
-    }
-
-    return str;
-}
-
-//20250123 BY MKLIU
-// 消息解密
-function decodeContent(content)
-{
-    let str = '';
-    for (let i=0; i<content.length; i++)
-    {
-        str += String.fromCharCode(room.decode[content.charCodeAt(i)]);
-    }
-
-    str = window.atob(str);
-    str = decodeURIComponent(str);
-
-    return str;
-}
-
-$(function(){
-    let userName = window.localStorage.getItem('r_' + room.name);
-    if (userName)
-    {
-        $('#txtUser').val(userName);
-    }
-
-    $('#txtContent').keydown(function(e){
-        if(e.keyCode==13){
-            event.preventDefault();
-            sendMsg();
-        }
-    });
-
-    $('#txtContent').val('🥳 我来了!');
-    sendMsg();
-});
-
-function createRoom() {
-    let password = document.getElementById('txtPassword').value;
-    window.location.href = 'index.php?type=new&password=' + encodeURIComponent(password);
-}
-
-// 呈现在线chatrooms
-var chatrooms = <?= json_encode($chatrooms) ?>;
-var chatroomList = document.getElementById('chatroomList');
-chatrooms.forEach(function(room) {
-    var roomLink = document.createElement('a');
-    roomLink.href = 'index.php?room=' + room;
-    roomLink.textContent = room;
-    chatroomList.appendChild(roomLink);
-    chatroomList.appendChild(document.createElement('br'));
-});
-</script>
-<div align="center">
-    Copyright © 2025-2026 By <a href="https://www.mkliu.top/"><strong>michaelliunsky</strong></a> & <strong>Yuer6327</strong>
+    <div class="input-area">
+      <div class="input-row">
+        <textarea id="txtContent" rows="1" placeholder="输入消息…"></textarea>
+        <button class="send" onclick="sendMsg()">发送</button>
+      </div>
+      <div class="input-hint">Enter 发送 · Shift+Enter 换行</div>
+    </div>
+  </section>
 </div>
+
+<!-- Create modal -->
+<div class="veil" id="vCreate">
+  <div class="panel">
+    <div class="panel-title">新建房间</div>
+    <div class="panel-sub">房间 ID 随机生成。密码留空则自动生成。</div>
+    <div class="field-label">密码（可选）</div>
+    <input type="password" id="newPw" class="field" placeholder="留空自动生成">
+    <div class="panel-row">
+      <button class="btn-line" onclick="closeCreate()">取消</button>
+      <button class="btn-dark" id="createBtn" onclick="doCreate()">创建</button>
+    </div>
+  </div>
+</div>
+
+<!-- Result modal -->
+<div class="veil" id="vResult">
+  <div class="panel">
+    <div class="panel-title">房间已创建</div>
+    <div class="panel-sub">请保存以下信息，密码无法找回。</div>
+    <div class="result-block">
+      <div class="result-item"><span class="rk">房间号</span><span class="rv" id="rRoom">—</span></div>
+      <div class="result-item"><span class="rk">密码</span><span class="rv" id="rPw">—</span></div>
+    </div>
+    <div class="panel-row">
+      <button class="btn-dark" onclick="goRoom()">进入房间</button>
+    </div>
+  </div>
+</div>
+
+<?php endif; ?>
+
+<div class="toasts" id="toasts"></div>
+
+<script id="wk" type="app/worker">
+var room='<?= $room_data['name'] ?>',busy=false,lastId=-1,base='';
+addEventListener('message',function(e){base=e.data;});
+setInterval(function(){
+  if(busy)return;busy=true;
+  fetch(new URL('index.php?type=get&room='+room+'&last_id='+lastId,base))
+    .then(function(r){return r.json();})
+    .then(function(d){
+      busy=false;
+      if(d.list.length)lastId=d.list[d.list.length-1].id;
+      self.postMessage(d);
+    }).catch(function(){busy=false;});
+},1000);
+</script>
+
+<script>
+function toast(msg,type){
+  var t=document.createElement('div');
+  t.className='toast'+(type?' '+type:'');
+  t.textContent=msg;
+  document.getElementById('toasts').appendChild(t);
+  setTimeout(function(){t.style.animation='tout .15s forwards';setTimeout(function(){t.remove();},150);},2500);
+}
+
+<?php if (!$requireAuth): ?>
+var R=<?= json_encode($room_data) ?>;
+R.dec={};
+for(var k in R.encode) R.dec[R.encode[k]]=k;
+
+function enc(s){s=encodeURIComponent(s);s=btoa(s);var o='';for(var i=0;i<s.length;i++)o+=String.fromCharCode(R.encode[s.charCodeAt(i)]);return o;}
+function dec(s){var o='';for(var i=0;i<s.length;i++)o+=String.fromCharCode(R.dec[s.charCodeAt(i)]);return decodeURIComponent(atob(o));}
+function esc(s){return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+
+var wk=new Worker(URL.createObjectURL(new Blob([document.getElementById('wk').textContent])));
+var seen={};
+
+wk.onmessage=function(e){
+  if(!e.data.list.length)return;
+  var f=document.createDocumentFragment();
+  e.data.list.forEach(function(r){
+    if(seen[r.id])return;seen[r.id]=1;
+    f.prepend(buildMsg(r));
+  });
+  var es=document.getElementById('es');if(es)es.remove();
+  document.getElementById('msgs').prepend(f);
+};
+wk.postMessage(document.baseURI);
+
+function buildMsg(r){
+  var text='';try{text=dec(r.content);}catch(e){text=r.content;}
+  var d=document.createElement('div');d.className='msg';
+  d.innerHTML='<div class="msg-who">'+esc(r.user)+'</div>'
+    +'<div class="msg-right">'
+    +'<div class="msg-time">'+r.time+'</div>'
+    +'<div class="msg-text">'+esc(text)+'</div>'
+    +'</div>';
+  return d;
+}
+
+var lastSend=0;
+function sendMsg(){
+  var user=document.getElementById('txtUser').value.trim();
+  var txt=document.getElementById('txtContent').value.trim();
+  if(!txt)return;
+  if(!user){toast('请输入昵称','err');return;}
+  if(Date.now()-lastSend<300)return;
+  lastSend=Date.now();
+  localStorage.setItem('r_'+R.name,user);
+  fetch('index.php?type=send',{
+    method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},
+    body:new URLSearchParams({room:R.name,user:user,content:enc(txt)})
+  }).then(function(){document.getElementById('txtContent').value='';resize();})
+    .catch(function(){toast('发送失败，请重试','err');});
+}
+
+var newRes=null;
+function openCreate(){document.getElementById('vCreate').classList.add('on');}
+function closeCreate(){document.getElementById('vCreate').classList.remove('on');}
+function doCreate(){
+  var pw=document.getElementById('newPw').value;
+  var btn=document.getElementById('createBtn');
+  btn.textContent='…';btn.disabled=true;
+  fetch('index.php?type=new',{
+    method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},
+    body:new URLSearchParams({password:pw})
+  })
+    .then(function(r){return r.json();})
+    .then(function(d){
+      btn.textContent='创建';btn.disabled=false;
+      if(d.result==='ok'){newRes=d;closeCreate();document.getElementById('rRoom').textContent=d.room;document.getElementById('rPw').textContent=d.password;document.getElementById('vResult').classList.add('on');}
+    })
+    .catch(function(){btn.textContent='创建';btn.disabled=false;toast('创建失败，请重试','err');});
+}
+function goRoom(){if(newRes)window.location.href='index.php?room='+newRes.room;}
+
+function clearMsgs(){
+  document.getElementById('msgs').innerHTML='<div class="no-msgs" id="es">暂无消息</div>';
+  seen={};
+}
+
+var ta=document.getElementById('txtContent');
+function resize(){ta.style.height='auto';ta.style.height=Math.min(ta.scrollHeight,108)+'px';}
+ta.addEventListener('input',resize);
+ta.addEventListener('keydown',function(e){if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();sendMsg();}});
+
+(function(){
+  var s=localStorage.getItem('r_'+R.name);if(s)document.getElementById('txtUser').value=s;
+  document.getElementById('txtContent').value='🥳 我来了！';sendMsg();
+})();
+
+function checkW(){document.getElementById('menuBtn').style.display=window.innerWidth<=600?'flex':'none';}
+checkW();window.addEventListener('resize',checkW);
+<?php endif; ?>
+</script>
 </body>
 </html>
