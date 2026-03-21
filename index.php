@@ -1,14 +1,193 @@
 <?php
 // 单页面在线聊天
-// 20250123 20260315 BY MKLIU
+// 20250123 20260315 20260321 BY MKLIU
 include 'config.php';
 date_default_timezone_set("PRC");
 error_reporting(E_ALL & ~E_NOTICE);
 set_time_limit(30);
+if (session_status() !== PHP_SESSION_ACTIVE) session_start();
+ob_start();
 
 $room = preg_replace('/[^a-zA-Z0-9_\-]/', '', $_REQUEST['room'] ?? 'default');
 if ($room === '') $room = 'default';
 $type = strtolower($_REQUEST['type'] ?? 'enter');
+
+function chatJson($payload) {
+    while (ob_get_level() > 0) ob_end_clean();
+    header('Content-Type: application/json');
+    echo json_encode($payload, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+    exit;
+}
+
+function readJsonFile($path, $default = []) {
+    if (!file_exists($path)) return $default;
+    $raw = file_get_contents($path);
+    if ($raw === false || $raw === '') return $default;
+    $data = json_decode($raw, true);
+    return is_array($data) ? $data : $default;
+}
+
+function writeJsonFile($path, $data) {
+    file_put_contents($path, json_encode($data, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES), LOCK_EX);
+}
+
+function getRoomFile($room) {
+    return './chat_data/' . $room . '.txt';
+}
+
+function getUploadDir($room) {
+    return './chat_data/uploads/' . $room;
+}
+
+function hasRoomAccess($room) {
+    return $room === 'default' || !empty($_SESSION['chat_rooms'][$room]);
+}
+
+function grantRoomAccess($room) {
+    if ($room === 'default') return;
+    if (!isset($_SESSION['chat_rooms']) || !is_array($_SESSION['chat_rooms'])) $_SESSION['chat_rooms'] = [];
+    $_SESSION['chat_rooms'][$room] = true;
+}
+
+function ensureRoomAccess($room, $room_file, $asJson = true) {
+    if (!file_exists($room_file)) {
+        if ($asJson) chatJson(['result' => 'error', 'msg' => 'room not found']);
+        http_response_code(404);
+        exit('Not found');
+    }
+
+    $roomData = readJsonFile($room_file, []);
+    if (empty($roomData['password']) || hasRoomAccess($room)) return $roomData;
+
+    if ($asJson) {
+        http_response_code(403);
+        chatJson(['result' => 'error', 'msg' => 'forbidden']);
+    }
+
+    http_response_code(403);
+    exit('Forbidden');
+}
+
+function ensureUploadDir($room) {
+    $dir = getUploadDir($room);
+    if (!is_dir($dir) && !@mkdir($dir, 0777, true) && !is_dir($dir)) {
+        throw new RuntimeException('上传目录创建失败');
+    }
+    return $dir;
+}
+
+function normalizeFileName($name) {
+    $name = trim($name);
+    if ($name === '') return 'file';
+    $name = preg_replace('/[^\w.\-\x{4e00}-\x{9fa5}]+/u', '_', $name);
+    return trim($name, '._') ?: 'file';
+}
+
+function mimeFromExtension($name) {
+    $ext = strtolower(pathinfo($name, PATHINFO_EXTENSION));
+    $map = [
+        'jpg' => 'image/jpeg',
+        'jpeg' => 'image/jpeg',
+        'png' => 'image/png',
+        'gif' => 'image/gif',
+        'webp' => 'image/webp',
+        'bmp' => 'image/bmp',
+        'svg' => 'image/svg+xml',
+        'pdf' => 'application/pdf',
+        'txt' => 'text/plain',
+        'md' => 'text/markdown',
+        'json' => 'application/json',
+        'zip' => 'application/zip',
+        'rar' => 'application/vnd.rar',
+        '7z' => 'application/x-7z-compressed',
+        'doc' => 'application/msword',
+        'docx' => 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+        'xls' => 'application/vnd.ms-excel',
+        'xlsx' => 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        'ppt' => 'application/vnd.ms-powerpoint',
+        'pptx' => 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+    ];
+    return $map[$ext] ?? 'application/octet-stream';
+}
+
+function detectMimeType($path, $originalName = '') {
+    if (function_exists('finfo_open')) {
+        $finfo = finfo_open(FILEINFO_MIME_TYPE);
+        if ($finfo) {
+            $mime = finfo_file($finfo, $path);
+            finfo_close($finfo);
+            if (is_string($mime) && $mime !== '') return $mime;
+        }
+    }
+
+    if (function_exists('mime_content_type')) {
+        $mime = @mime_content_type($path);
+        if (is_string($mime) && $mime !== '') return $mime;
+    }
+
+    if (function_exists('getimagesize')) {
+        $imageInfo = @getimagesize($path);
+        if (!empty($imageInfo['mime'])) return $imageInfo['mime'];
+    }
+
+    return mimeFromExtension($originalName !== '' ? $originalName : basename($path));
+}
+
+function isImageMime($mime) {
+    return in_array($mime, ['image/jpeg', 'image/png', 'image/gif', 'image/webp', 'image/bmp'], true);
+}
+
+function buildAttachmentUrl($room, $storedName, $download = false) {
+    $params = ['type' => 'asset', 'room' => $room, 'file' => $storedName];
+    if ($download) $params['download'] = '1';
+    return 'index.php?' . http_build_query($params);
+}
+
+function parseAttachments($room) {
+    if (empty($_FILES['attachments']) || !is_array($_FILES['attachments']['name'])) return [];
+
+    $maxFileSize = 10 * 1024 * 1024;
+    $files = [];
+    $count = count($_FILES['attachments']['name']);
+    if ($count > 6) throw new RuntimeException('一次最多发送 6 个附件');
+
+    $dir = ensureUploadDir($room);
+
+    for ($i = 0; $i < $count; $i++) {
+        $error = $_FILES['attachments']['error'][$i] ?? UPLOAD_ERR_NO_FILE;
+        if ($error === UPLOAD_ERR_NO_FILE) continue;
+        if ($error !== UPLOAD_ERR_OK) throw new RuntimeException('附件上传失败');
+
+        $tmpName = $_FILES['attachments']['tmp_name'][$i] ?? '';
+        if ($tmpName === '' || !is_uploaded_file($tmpName)) throw new RuntimeException('附件上传失败');
+
+        $size = (int)($_FILES['attachments']['size'][$i] ?? 0);
+        if ($size <= 0) throw new RuntimeException('附件不能为空');
+        if ($size > $maxFileSize) throw new RuntimeException('单个附件不能超过 10MB');
+
+        $originalName = normalizeFileName($_FILES['attachments']['name'][$i] ?? 'file');
+        $mime = detectMimeType($tmpName, $originalName);
+
+        $ext = strtolower(pathinfo($originalName, PATHINFO_EXTENSION));
+        $storedName = bin2hex(random_bytes(16));
+        if ($ext !== '') $storedName .= '.' . $ext;
+        $storedPath = $dir . '/' . $storedName;
+
+        if (!move_uploaded_file($tmpName, $storedPath)) throw new RuntimeException('附件保存失败');
+
+        $files[] = [
+            'name' => $originalName,
+            'stored_name' => $storedName,
+            'mime' => $mime,
+            'size' => $size,
+            'kind' => isImageMime($mime) ? 'image' : 'file',
+            'url' => buildAttachmentUrl($room, $storedName, false),
+            'download_url' => buildAttachmentUrl($room, $storedName, true),
+        ];
+    }
+
+    return $files;
+}
 
 function getChatrooms() {
     $files = glob('./chat_data/*.txt');
@@ -20,12 +199,12 @@ function getChatrooms() {
 function generateRandomPassword() {
     $chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
     $pw = '';
-    for ($i = 0; $i < 8; $i++) $pw .= $chars[rand(0, strlen($chars) - 1)];
+    for ($i = 0; $i < 8; $i++) $pw .= $chars[random_int(0, strlen($chars) - 1)];
     return $pw;
 }
 
 function newRoom($room, $custompassword = null) {
-    $room_file = './chat_data/' . $room . '.txt';
+    $room_file = getRoomFile($room);
     $key_list  = array_merge(range(48, 57), range(65, 90), range(97, 122), [43, 47, 61]);
     $key1_list = $key_list;
     shuffle($key1_list);
@@ -37,31 +216,27 @@ function newRoom($room, $custompassword = null) {
         'time'     => date('Y-m-d H:i:s'),
         'password' => ($room === 'default') ? null : password_hash($custompassword, PASSWORD_DEFAULT),
     ];
-    file_put_contents($room_file, json_encode($data));
+    writeJsonFile($room_file, $data);
     return $custompassword;
 }
 
 function getMsg($room, $last_id) {
-    $room_file = './chat_data/' . $room . '.txt';
-    $data      = json_decode(file_get_contents($room_file), true);
-    $list      = $data['list'];
+    $room_file = getRoomFile($room);
+    $data      = readJsonFile($room_file, ['list' => []]);
+    $list      = $data['list'] ?? [];
     $del_time  = date('Y-m-d H:i:s', time() - 604800);
     $cur = array_values(array_filter($list, fn($r) => $r['time'] > $del_time));
     if (count($cur) !== count($list)) {
         $data['list'] = $cur;
-        file_put_contents($room_file, json_encode($data));
+        writeJsonFile($room_file, $data);
     }
     return array_values(array_filter($cur, fn($r) => $r['id'] > $last_id));
 }
 
 if ($type === 'get') {
     $last_id  = (int)($_REQUEST['last_id'] ?? -1);
-    $room_file_get = './chat_data/' . $room . '.txt';
-    if (!file_exists($room_file_get)) {
-        header('Content-Type: application/json');
-        echo json_encode(['result' => 'ok', 'list' => []]);
-        exit;
-    }
+    $room_file_get = getRoomFile($room);
+    ensureRoomAccess($room, $room_file_get);
     $msg_list = [];
     if (strpos($_SERVER['SERVER_SOFTWARE'] ?? '', 'nginx') !== false) {
         $msg_list = getMsg($room, $last_id);
@@ -72,44 +247,78 @@ if ($type === 'get') {
             usleep(500000);
         }
     }
-    header('Content-Type: application/json');
-    echo json_encode(['result' => 'ok', 'list' => $msg_list]);
+    chatJson(['result' => 'ok', 'list' => $msg_list]);
+}
+
+if ($type === 'asset') {
+    $room_file = getRoomFile($room);
+    $file = basename($_REQUEST['file'] ?? '');
+    $path = getUploadDir($room) . '/' . $file;
+    $roomData = ensureRoomAccess($room, $room_file, false);
+
+    if ($file === '' || !is_file($path)) {
+        http_response_code(404);
+        exit('Not found');
+    }
+
+    $download = isset($_REQUEST['download']) && $_REQUEST['download'] === '1';
+    $mime = detectMimeType($path, $file);
+    $name = $file;
+
+    foreach ($roomData['list'] ?? [] as $item) {
+        foreach ($item['attachments'] ?? [] as $attachment) {
+            if (($attachment['stored_name'] ?? '') === $file) {
+                $name = $attachment['name'] ?? $name;
+                $mime = $attachment['mime'] ?? $mime;
+                break 2;
+            }
+        }
+    }
+
+    header('Content-Type: ' . $mime);
+    header('X-Content-Type-Options: nosniff');
+    header('Content-Length: ' . filesize($path));
+    $disposition = $download || !isImageMime($mime) ? 'attachment' : 'inline';
+    $safeName = str_replace(['"', "\r", "\n"], '', $name);
+    header('Content-Disposition: ' . $disposition . '; filename="' . $safeName . '"; filename*=UTF-8\'\'' . rawurlencode($safeName));
+    readfile($path);
     exit;
 }
 
 if ($type === 'send') {
-    $room_file = './chat_data/' . $room . '.txt';
-    if (!file_exists($room_file)) {
-        header('Content-Type: application/json');
-        echo json_encode(['result' => 'error', 'msg' => 'room not found']);
-        exit;
+    $room_file = getRoomFile($room);
+    ensureRoomAccess($room, $room_file);
+    try {
+        $attachments = parseAttachments($room);
+    } catch (Throwable $e) {
+        chatJson(['result' => 'error', 'msg' => $e->getMessage()]);
+    }
+    $content = $_REQUEST['content'] ?? '';
+    if (trim($content) === '' && empty($attachments)) {
+        chatJson(['result' => 'error', 'msg' => 'empty message']);
     }
     $item = [
-        'id'      => round(microtime(true) * 1000),
-        'user'    => htmlspecialchars(substr($_REQUEST['user'] ?? 'anon', 0, 50)),
-        'content' => $_REQUEST['content'] ?? '',
-        'time'    => date('Y-m-d H:i:s'),
+        'id'          => round(microtime(true) * 1000),
+        'user'        => trim(substr($_REQUEST['user'] ?? 'anon', 0, 50)) ?: 'anon',
+        'content'     => $content,
+        'time'        => date('Y-m-d H:i:s'),
+        'attachments' => $attachments,
     ];
-    $data           = json_decode(file_get_contents($room_file), true);
+    $data           = readJsonFile($room_file, ['list' => []]);
     $data['list'][] = $item;
-    file_put_contents($room_file, json_encode($data));
-    header('Content-Type: application/json');
-    echo json_encode(['result' => 'ok']);
-    exit;
+    writeJsonFile($room_file, $data);
+    chatJson(['result' => 'ok']);
 }
 
 if ($type === 'new') {
-    mt_srand();
-    $newroom  = strtoupper(substr(md5(uniqid(mt_rand(), true)), 0, 10));
+    $newroom  = strtoupper(bin2hex(random_bytes(5)));
     $pw_input = $_POST['password'] ?? null;
     $gen_pw   = newRoom($newroom, $pw_input ?: null);
-    header('Content-Type: application/json');
-    echo json_encode(['result' => 'ok', 'room' => $newroom, 'password' => $gen_pw]);
-    exit;
+    chatJson(['result' => 'ok', 'room' => $newroom, 'password' => $gen_pw]);
 }
 
 // Page render
-$room_file   = './chat_data/' . $room . '.txt';
+$room_file   = getRoomFile($room);
 $requireAuth = false;
 $authError   = '';
 
@@ -117,19 +326,24 @@ if ($room === 'default') {
     if (!file_exists($room_file)) newRoom($room);
 } else {
     if (!file_exists($room_file)) { header('Location: index.php'); exit; }
-    if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['auth_submit'])) {
-        $input_pw      = $_POST['password'] ?? '';
-        $room_data_tmp = json_decode(file_get_contents($room_file), true);
-        if (!password_verify($input_pw, $room_data_tmp['password'])) {
+    $room_data_tmp = readJsonFile($room_file, []);
+    if (hasRoomAccess($room)) {
+        $requireAuth = false;
+    } elseif ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['auth_submit'])) {
+        $input_pw = $_POST['password'] ?? '';
+        if (!password_verify($input_pw, $room_data_tmp['password'] ?? '')) {
             $requireAuth = true;
             $authError   = '密码错误';
+        } else {
+            grantRoomAccess($room);
+            $requireAuth = false;
         }
     } else {
         $requireAuth = true;
     }
 }
 
-$room_data = json_decode(file_get_contents($room_file), true);
+$room_data = readJsonFile($room_file, []);
 unset($room_data['list']);
 
 $user      = 'User' . str_pad((time() % 99 + 1), 2, '0', STR_PAD_LEFT);
@@ -159,6 +373,8 @@ $chatrooms = getChatrooms();
   --sans: 'Inter', 'Noto Sans SC', sans-serif;
   --mono: 'Menlo', 'Monaco', 'Consolas', monospace;
   --sw: 260px;
+  --r-btn: 6px;
+  --h-btn: 32px;
 }
 
 html, body { height: 100dvh; background: var(--c0); color: var(--c7); font-family: var(--sans); font-size: 15px; overflow: hidden; -webkit-font-smoothing: antialiased; }
@@ -266,7 +482,7 @@ html, body { height: 100dvh; background: var(--c0); color: var(--c7); font-famil
   margin-top: 8px;
   padding: 6px 8px;
   border: 1px solid var(--c3);
-  border-radius: 5px;
+  border-radius: var(--r-btn);
   background: transparent;
   font-size: 12px;
   color: var(--c5);
@@ -291,9 +507,10 @@ html, body { height: 100dvh; background: var(--c0); color: var(--c7); font-famil
 .topbar-meta { font-size: 11px; color: var(--c5); margin-left: 8px; font-weight: 400; font-family: var(--sans); }
 
 .clear-btn {
-  padding: 4px 10px;
+  height: var(--h-btn);
+  padding: 0 12px;
   border: 1px solid var(--c3);
-  border-radius: 4px;
+  border-radius: var(--r-btn);
   background: transparent;
   font-size: 12px;
   color: var(--c5);
@@ -301,6 +518,17 @@ html, body { height: 100dvh; background: var(--c0); color: var(--c7); font-famil
   transition: color .15s, border-color .15s;
 }
 .clear-btn:hover { color: var(--c7); border-color: var(--c6); }
+
+.icon-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: var(--h-btn);
+  min-width: var(--h-btn);
+  padding: 0;
+  line-height: 1;
+  font-size: 16px;
+}
 
 /* Messages */
 .msgs {
@@ -347,6 +575,68 @@ html, body { height: 100dvh; background: var(--c0); color: var(--c7); font-famil
   word-break: break-word;
 }
 
+.msg-media {
+  display: grid;
+  gap: 8px;
+  margin-top: 8px;
+  width: min(560px, 100%);
+}
+
+.msg-image {
+  display: block;
+  max-width: min(320px, 100%);
+  border: 1px solid var(--c3);
+  border-radius: 10px;
+  background: var(--c1);
+}
+
+.msg-file {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--c3);
+  border-radius: 10px;
+  background: var(--c1);
+}
+
+.msg-file-meta {
+  min-width: 0;
+}
+
+.msg-file-name {
+  font-size: 13px;
+  color: var(--c7);
+  font-weight: 600;
+  word-break: break-word;
+}
+
+.msg-file-size {
+  margin-top: 2px;
+  font-size: 11px;
+  color: var(--c5);
+  font-family: var(--mono);
+}
+
+.file-download {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 72px;
+  height: var(--h-btn);
+  padding: 0 12px;
+  border: 1px solid var(--c3);
+  border-radius: var(--r-btn);
+  color: var(--c7);
+  text-decoration: none;
+  font-size: 12px;
+  transition: border-color .15s, background .15s;
+  background: var(--c0);
+}
+.file-download:hover { border-color: var(--c6); background: var(--c2); }
+
 .no-msgs {
   display: flex; align-items: center; justify-content: center;
   flex: 1;
@@ -362,41 +652,163 @@ html, body { height: 100dvh; background: var(--c0); color: var(--c7); font-famil
 }
 
 .input-row {
-  display: flex; gap: 8px; align-items: flex-end;
+  display: block;
+}
+
+.composer {
+  flex: 1;
+  min-width: 0;
+  border: 1px solid var(--c3);
+  border-radius: 8px;
+  background: var(--c0);
+  padding: 10px 12px;
+  transition: border-color .15s, background .15s, box-shadow .15s;
+}
+
+.composer:focus-within {
+  border-color: var(--c6);
+  box-shadow: 0 0 0 3px rgba(17,17,16,.03);
+}
+
+.composer.drag-on {
+  border-color: var(--c6);
+  background: var(--c1);
+  box-shadow: inset 0 0 0 1px rgba(17,17,16,.04);
 }
 
 #txtContent {
-  flex: 1;
-  border: 1px solid var(--c3);
-  border-radius: 6px;
-  padding: 8px 11px;
+  width: 100%;
+  border: none;
+  border-radius: 0;
+  padding: 0;
   font-size: 14px;
   font-family: var(--sans);
   color: var(--c7);
-  background: var(--c0);
+  background: transparent;
   outline: none;
   resize: none;
-  min-height: 36px;
+  min-height: 28px;
   max-height: 108px;
-  line-height: 1.5;
-  transition: border-color .15s;
+  line-height: 1.55;
 }
-#txtContent:focus { border-color: var(--c6); }
 #txtContent::placeholder { color: var(--c4); }
 
+.attach-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+.attach-list:empty {
+  display: none;
+}
+
+.pick-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  height: var(--h-btn);
+  padding: 0 12px;
+  border: 1px solid var(--c3);
+  border-radius: var(--r-btn);
+  background: var(--c1);
+  color: var(--c6);
+  font-size: 12px;
+  cursor: pointer;
+  transition: color .15s, border-color .15s, background .15s;
+}
+.pick-btn:hover { color: var(--c7); border-color: var(--c6); background: var(--c2); }
+
+.pick-input { display: none; }
+
+.composer-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 6px;
+  padding-top: 6px;
+  border-top: 1px solid var(--c2);
+}
+
+.composer-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-left: auto;
+}
+
+.attach-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  max-width: 100%;
+  padding: 5px 8px;
+  border-radius: 5px;
+  background: var(--c1);
+  border: 1px solid var(--c3);
+  font-size: 12px;
+  color: var(--c6);
+}
+
+.attach-chip-name {
+  max-width: 240px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.attach-chip-remove {
+  border: none;
+  background: transparent;
+  color: var(--c5);
+  font-size: 14px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 0;
+}
+.attach-chip-remove:hover { color: var(--red); }
+
+.drop-hint {
+  display: block;
+  flex: 1;
+  min-width: 0;
+  color: var(--c5);
+  font-size: 11px;
+  line-height: 1.45;
+  min-height: 16px;
+  transition: color .18s, opacity .18s;
+}
+
+.composer.drag-on .drop-hint {
+  color: var(--c6);
+}
+
 .send {
-  height: 36px; padding: 0 14px;
+  height: var(--h-btn); padding: 0 12px;
   background: var(--c7);
-  border: none; border-radius: 6px;
+  border: none; border-radius: var(--r-btn);
   color: var(--c0);
-  font-size: 13px; font-weight: 500;
+  font-size: 12px; font-weight: 600;
   cursor: pointer;
   flex-shrink: 0;
-  transition: background .15s;
+  transition: background .15s, transform .15s;
 }
 .send:hover { background: var(--c6); }
+.send:active { transform: translateY(1px); }
+.send:disabled {
+  cursor: default;
+  background: var(--c5);
+  transform: none;
+}
 
-.input-hint { font-size: 11px; color: var(--c4); margin-top: 5px; }
+.input-hint {
+  margin-top: 9px;
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--c4);
+}
 
 /* Modals */
 .veil {
@@ -444,17 +856,18 @@ html, body { height: 100dvh; background: var(--c0); color: var(--c7); font-famil
 .panel-row { display: flex; gap: 8px; }
 
 .btn-dark {
-  flex: 1; padding: 8px;
-  background: var(--c7); border: none; border-radius: 5px;
+  flex: 1; min-height: 38px; padding: 8px 14px;
+  background: var(--c7); border: none; border-radius: var(--r-btn);
   color: var(--c0); font-size: 13px; font-weight: 500;
   cursor: pointer; transition: background .15s;
 }
 .btn-dark:hover { background: var(--c6); }
 
 .btn-line {
+  min-height: 38px;
   padding: 8px 14px;
   background: transparent;
-  border: 1px solid var(--c3); border-radius: 5px;
+  border: 1px solid var(--c3); border-radius: var(--r-btn);
   color: var(--c5); font-size: 13px;
   cursor: pointer; transition: color .15s, border-color .15s;
 }
@@ -537,17 +950,21 @@ html, body { height: 100dvh; background: var(--c0); color: var(--c7); font-famil
   .topbar      { height: 52px; padding: 0 20px; }
   .topbar-room { font-size: 15px; }
   .topbar-meta { font-size: 13px; }
-  .clear-btn   { font-size: 13px; padding: 5px 12px; }
+  .clear-btn   { font-size: 13px; padding: 0 14px; }
   .msgs        { padding: 16px 20px; }
   .msg         { padding: 6px 0; gap: 0 12px; }
   .msg-who     { font-size: 14px; min-width: 90px; max-width: 140px; }
   .msg-time    { font-size: 12px; }
   .msg-text    { font-size: 15px; }
+  .msg-file-name { font-size: 14px; }
   .no-msgs     { font-size: 14px; }
   .input-area  { padding: 12px 18px 16px; }
-  #txtContent  { font-size: 15px; padding: 9px 12px; }
-  .send        { font-size: 14px; height: 38px; padding: 0 18px; }
+  #txtContent  { font-size: 15px; padding: 0; }
+  .send        { font-size: 13px; height: 34px; padding: 0 14px; }
+  .pick-btn    { font-size: 13px; height: 34px; padding: 0 14px; }
+  .file-download { font-size: 13px; height: 34px; }
   .input-hint  { font-size: 12px; }
+  .drop-hint   { font-size: 12px; }
   .panel-title { font-size: 16px; }
   .panel-sub   { font-size: 13px; }
   .field-label { font-size: 12px; }
@@ -558,6 +975,27 @@ html, body { height: 100dvh; background: var(--c0); color: var(--c7); font-famil
   .auth-err    { font-size: 13px; }
   .toast       { font-size: 13px; }
 }
+
+@media (max-width: 600px) {
+  #menuBtn {
+    align-items: center;
+    justify-content: center;
+  }
+  .composer-footer {
+    flex-direction: column;
+    align-items: stretch;
+  }
+  .composer-actions {
+    width: 100%;
+    justify-content: space-between;
+  }
+  .attach-list {
+    width: 100%;
+  }
+  .drop-hint {
+    width: 100%;
+  }
+}
 </style>
 </head>
 <body>
@@ -566,7 +1004,7 @@ html, body { height: 100dvh; background: var(--c0); color: var(--c7); font-famil
 <div class="auth-wrap">
   <div class="auth-box">
     <div class="auth-title"><?= htmlspecialchars($room) ?></div>
-    <div class="auth-sub">此房间需要密码。</div>
+    <div class="auth-sub">输入密码后进入</div>
     <?php if ($authError): ?>
       <div class="auth-err"><?= htmlspecialchars($authError) ?></div>
     <?php endif; ?>
@@ -620,12 +1058,12 @@ html, body { height: 100dvh; background: var(--c0); color: var(--c7); font-famil
   <section class="main">
     <div class="topbar">
       <div style="display:flex;align-items:center;gap:8px">
-        <button class="clear-btn" id="menuBtn" style="display:none"
+        <button class="clear-btn icon-btn" id="menuBtn" style="display:none"
                 onclick="document.getElementById('side').classList.toggle('open')">☰</button>
         <span class="topbar-room"><?= htmlspecialchars($room_data['name']) ?></span>
         <span class="topbar-meta"><?= date('Y-m-d') ?></span>
       </div>
-      <button class="clear-btn" onclick="clearMsgs()">清空</button>
+      <button class="clear-btn" onclick="clearMsgs()">清屏</button>
     </div>
 
     <div class="msgs" id="msgs">
@@ -634,10 +1072,20 @@ html, body { height: 100dvh; background: var(--c0); color: var(--c7); font-famil
 
     <div class="input-area">
       <div class="input-row">
-        <textarea id="txtContent" rows="1" placeholder="输入消息…"></textarea>
-        <button class="send" onclick="sendMsg()">发送</button>
+        <div class="composer">
+          <textarea id="txtContent" rows="1" placeholder="输入消息 / 添加附件 / 拖拽 / 粘贴"></textarea>
+          <div class="attach-list" id="attachList"></div>
+          <div class="composer-footer">
+            <div class="drop-hint" id="dropHint">添加附件 / 拖拽 / 粘贴 / 10MB 内</div>
+            <div class="composer-actions">
+              <label class="pick-btn" for="fileInput">添加附件</label>
+              <input id="fileInput" class="pick-input" type="file" multiple>
+              <button class="send" id="sendBtn" type="button" onclick="sendMsg()">发送</button>
+            </div>
+          </div>
+        </div>
       </div>
-      <div class="input-hint">Enter 发送 · Shift+Enter 换行</div>
+      <div class="input-hint">Enter 发送 / Shift+Enter 换行</div>
     </div>
   </section>
 </div>
@@ -646,8 +1094,8 @@ html, body { height: 100dvh; background: var(--c0); color: var(--c7); font-famil
 <div class="veil" id="vCreate">
   <div class="panel">
     <div class="panel-title">新建房间</div>
-    <div class="panel-sub">房间 ID 随机生成。密码留空则自动生成。</div>
-    <div class="field-label">密码（可选）</div>
+    <div class="panel-sub">房间号自动生成 / 密码留空自动生成</div>
+    <div class="field-label">密码 可选</div>
     <input type="password" id="newPw" class="field" placeholder="留空自动生成">
     <div class="panel-row">
       <button class="btn-line" onclick="closeCreate()">取消</button>
@@ -660,7 +1108,7 @@ html, body { height: 100dvh; background: var(--c0); color: var(--c7); font-famil
 <div class="veil" id="vResult">
   <div class="panel">
     <div class="panel-title">房间已创建</div>
-    <div class="panel-sub">请保存以下信息，密码无法找回。</div>
+    <div class="panel-sub">请保存房间号和密码</div>
     <div class="result-block">
       <div class="result-item"><span class="rk">房间号</span><span class="rv" id="rRoom">—</span></div>
       <div class="result-item"><span class="rk">密码</span><span class="rv" id="rPw">—</span></div>
@@ -707,9 +1155,22 @@ for(var k in R.encode) R.dec[R.encode[k]]=k;
 function enc(s){s=encodeURIComponent(s);s=btoa(s);var o='';for(var i=0;i<s.length;i++)o+=String.fromCharCode(R.encode[s.charCodeAt(i)]);return o;}
 function dec(s){var o='';for(var i=0;i<s.length;i++)o+=String.fromCharCode(R.dec[s.charCodeAt(i)]);return decodeURIComponent(atob(o));}
 function esc(s){return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+function escAttr(s){return esc(s).replace(/"/g,'&quot;');}
+function fmtText(s){return esc(s).replace(/\n/g,'<br>');}
+function fmtSize(size){
+  if(size<1024)return size+' B';
+  if(size<1024*1024)return (size/1024).toFixed(size<10240?1:0)+' KB';
+  return (size/1024/1024).toFixed(size<10*1024*1024?1:0)+' MB';
+}
+function fileIcon(kind){return kind==='image'?'图片':'文件';}
+function hintText(text){
+  document.getElementById('dropHint').textContent=text;
+}
 
 var wk=new Worker(URL.createObjectURL(new Blob([document.getElementById('wk').textContent])));
 var seen={};
+var pickedFiles=[];
+var dragDepth=0;
 
 wk.onmessage=function(e){
   if(!e.data.list.length)return;
@@ -725,29 +1186,158 @@ wk.postMessage(document.baseURI);
 
 function buildMsg(r){
   var text='';try{text=dec(r.content);}catch(e){text=r.content;}
+  var attachments=Array.isArray(r.attachments)?r.attachments:[];
+  var media='';
+  if(attachments.length){
+    media='<div class="msg-media">'+attachments.map(function(file){
+      if(file.kind==='image'){
+        return '<a href="'+escAttr(file.url)+'" target="_blank" rel="noopener">'
+          +'<img class="msg-image" src="'+escAttr(file.url)+'" alt="'+escAttr(file.name||'image')+'" loading="lazy"></a>';
+      }
+      return '<div class="msg-file">'
+        +'<div class="msg-file-meta">'
+        +'<div class="msg-file-name">'+esc(file.name||'file')+'</div>'
+        +'<div class="msg-file-size">'+fileIcon(file.kind)+' · '+fmtSize(Number(file.size)||0)+'</div>'
+        +'</div>'
+        +'<a class="file-download" href="'+escAttr(file.download_url||file.url)+'" download>下载</a>'
+        +'</div>';
+    }).join('')+'</div>';
+  }
+  var textHtml=text?'<div class="msg-text">'+fmtText(text)+'</div>':'';
   var d=document.createElement('div');d.className='msg';
   d.innerHTML='<div class="msg-who">'+esc(r.user)+'</div>'
     +'<div class="msg-right">'
     +'<div class="msg-time">'+r.time+'</div>'
-    +'<div class="msg-text">'+esc(text)+'</div>'
+    +textHtml
+    +media
     +'</div>';
   return d;
 }
 
 var lastSend=0;
+var sending=false;
+function setComposerDrag(on){
+  composer.classList.toggle('drag-on',!!on);
+  updateInputHint();
+}
+
+function setSending(on){
+  sending=!!on;
+  sendBtn.disabled=sending;
+  sendBtn.textContent=sending?'发送中':'发送';
+}
+
+function addPickedFiles(next){
+  next=(next||[]).filter(function(file){return file&&file.size>=0;});
+  if(!next.length)return false;
+  if(pickedFiles.length+next.length>6){
+    toast('一次最多发送 6 个附件','err');
+    return false;
+  }
+  pickedFiles=pickedFiles.concat(next);
+  renderAttachList();
+  updateInputHint();
+  return true;
+}
+
+function renderAttachList(){
+  var el=document.getElementById('attachList');
+  el.innerHTML=pickedFiles.map(function(file,idx){
+    return '<div class="attach-chip">'
+      +'<span class="attach-chip-name">'+esc(file.name)+'</span>'
+      +'<button class="attach-chip-remove" type="button" onclick="removePickedFile('+idx+')">×</button>'
+      +'</div>';
+  }).join('');
+}
+
+function removePickedFile(idx){
+  pickedFiles.splice(idx,1);
+  renderAttachList();
+  updateInputHint();
+}
+
+function clearPickedFiles(){
+  pickedFiles=[];
+  document.getElementById('fileInput').value='';
+  renderAttachList();
+  updateInputHint();
+}
+
+function filesFromDataTransfer(dt){
+  if(!dt)return [];
+  if(dt.files&&dt.files.length)return Array.prototype.slice.call(dt.files);
+  return [];
+}
+
+function filesFromClipboard(e){
+  var files=[];
+  var cd=e.clipboardData;
+  if(!cd)return files;
+  if(cd.items&&cd.items.length){
+    Array.prototype.forEach.call(cd.items,function(item){
+      if(item.kind==='file'){
+        var file=item.getAsFile();
+        if(file)files.push(file);
+      }
+    });
+  }
+  if(!files.length&&cd.files&&cd.files.length){
+    files=Array.prototype.slice.call(cd.files);
+  }
+  return files;
+}
+
+function updateInputHint(){
+  var txt=ta.value.trim();
+  var dragging=composer.classList.contains('drag-on');
+  if(dragging){
+    hintText('松手添加');
+    return;
+  }
+  if(pickedFiles.length){
+    hintText('已选 '+pickedFiles.length+' 个附件 / 可继续输入');
+    return;
+  }
+  if(txt){
+    hintText('可继续添加附件 / 拖拽 / 粘贴');
+    return;
+  }
+  hintText('添加附件 / 拖拽 / 粘贴 / 10MB 内');
+}
+
 function sendMsg(){
   var user=document.getElementById('txtUser').value.trim();
-  var txt=document.getElementById('txtContent').value.trim();
-  if(!txt)return;
+  var textEl=document.getElementById('txtContent');
+  var rawTxt=textEl.value;
+  var txt=rawTxt.trim();
+  if(!txt&&!pickedFiles.length)return;
   if(!user){toast('请输入昵称','err');return;}
-  if(Date.now()-lastSend<300)return;
+  if(sending||Date.now()-lastSend<300)return;
   lastSend=Date.now();
+  setSending(true);
   localStorage.setItem('r_'+R.name,user);
+  var body=new FormData();
+  body.append('room',R.name);
+  body.append('user',user);
+  body.append('content',txt?enc(rawTxt):'');
+  pickedFiles.forEach(function(file){body.append('attachments[]',file,file.name);});
   fetch('index.php?type=send',{
-    method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},
-    body:new URLSearchParams({room:R.name,user:user,content:enc(txt)})
-  }).then(function(){document.getElementById('txtContent').value='';resize();})
-    .catch(function(){toast('发送失败，请重试','err');});
+    method:'POST',
+    body:body
+  }).then(function(r){return r.text();})
+    .then(function(text){
+      try{return JSON.parse(text);}
+      catch(e){throw new Error(text.indexOf('<')!==-1?'服务器异常 / 请检查 PHP 配置':'发送失败 / 请重试');}
+    })
+    .then(function(d){
+      if(d.result!=='ok')throw new Error(d.msg||'发送失败');
+      textEl.value='';
+      clearPickedFiles();
+      resize();
+      updateInputHint();
+    })
+    .catch(function(err){toast(err.message||'发送失败 / 请重试','err');})
+    .finally(function(){setSending(false);});
 }
 
 var newRes=null;
@@ -766,7 +1356,7 @@ function doCreate(){
       btn.textContent='创建';btn.disabled=false;
       if(d.result==='ok'){newRes=d;closeCreate();document.getElementById('rRoom').textContent=d.room;document.getElementById('rPw').textContent=d.password;document.getElementById('vResult').classList.add('on');}
     })
-    .catch(function(){btn.textContent='创建';btn.disabled=false;toast('创建失败，请重试','err');});
+    .catch(function(){btn.textContent='创建';btn.disabled=false;toast('创建失败 / 请重试','err');});
 }
 function goRoom(){if(newRes)window.location.href='index.php?room='+newRes.room;}
 
@@ -778,17 +1368,60 @@ function clearMsgs(){
 function closeSide(){document.getElementById('side').classList.remove('open');}
 
 var ta=document.getElementById('txtContent');
+var composer=document.querySelector('.composer');
+var sendBtn=document.getElementById('sendBtn');
 function resize(){ta.style.height='auto';ta.style.height=Math.min(ta.scrollHeight,108)+'px';}
-ta.addEventListener('input',resize);
+ta.addEventListener('input',function(){resize();updateInputHint();});
 ta.addEventListener('keydown',function(e){if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();sendMsg();}});
+ta.addEventListener('paste',function(e){
+  var files=filesFromClipboard(e);
+  if(!files.length)return;
+  e.preventDefault();
+  addPickedFiles(files);
+});
+composer.addEventListener('dragenter',function(e){
+  e.preventDefault();
+  dragDepth++;
+  setComposerDrag(true);
+  if(e.dataTransfer)e.dataTransfer.dropEffect='copy';
+});
+composer.addEventListener('dragover',function(e){
+  e.preventDefault();
+  setComposerDrag(true);
+  if(e.dataTransfer)e.dataTransfer.dropEffect='copy';
+});
+composer.addEventListener('dragleave',function(e){
+  e.preventDefault();
+  dragDepth=Math.max(0,dragDepth-1);
+  if(!dragDepth||!composer.contains(e.relatedTarget)){
+    dragDepth=0;
+    setComposerDrag(false);
+  }
+});
+composer.addEventListener('drop',function(e){
+  e.preventDefault();
+  dragDepth=0;
+  setComposerDrag(false);
+  addPickedFiles(filesFromDataTransfer(e.dataTransfer));
+});
+window.addEventListener('dragover',function(e){
+  if(e.dataTransfer&&Array.prototype.indexOf.call(e.dataTransfer.types||[],'Files')!==-1)e.preventDefault();
+});
+window.addEventListener('drop',function(e){
+  if(e.dataTransfer&&Array.prototype.indexOf.call(e.dataTransfer.types||[],'Files')!==-1)e.preventDefault();
+});
+document.getElementById('fileInput').addEventListener('change',function(e){
+  var next=Array.prototype.slice.call(e.target.files||[]);
+  if(!next.length)return;
+  addPickedFiles(next);
+  e.target.value='';
+});
 
 (function(){
   var s=localStorage.getItem('r_'+R.name);if(s)document.getElementById('txtUser').value=s;
-  document.getElementById('txtContent').value='🥳 我来了！';sendMsg();
+  resize();
+  updateInputHint();
 })();
-
-function checkW(){document.getElementById('menuBtn').style.display=window.innerWidth<=600?'flex':'none';}
-checkW();window.addEventListener('resize',checkW);
 <?php endif; ?>
 </script>
 </body>
