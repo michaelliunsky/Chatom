@@ -19,6 +19,10 @@ function chatJson($payload) {
     exit;
 }
 
+function releaseSessionLock() {
+    if (session_status() === PHP_SESSION_ACTIVE) session_write_close();
+}
+
 function readJsonFile($path, $default = []) {
     if (!file_exists($path)) return $default;
     $raw = file_get_contents($path);
@@ -237,6 +241,7 @@ if ($type === 'get') {
     $last_id  = (int)($_REQUEST['last_id'] ?? -1);
     $room_file_get = getRoomFile($room);
     ensureRoomAccess($room, $room_file_get);
+    releaseSessionLock();
     $msg_list = [];
     if (strpos($_SERVER['SERVER_SOFTWARE'] ?? '', 'nginx') !== false) {
         $msg_list = getMsg($room, $last_id);
@@ -255,6 +260,7 @@ if ($type === 'asset') {
     $file = basename($_REQUEST['file'] ?? '');
     $path = getUploadDir($room) . '/' . $file;
     $roomData = ensureRoomAccess($room, $room_file, false);
+    releaseSessionLock();
 
     if ($file === '' || !is_file($path)) {
         http_response_code(404);
@@ -288,6 +294,7 @@ if ($type === 'asset') {
 if ($type === 'send') {
     $room_file = getRoomFile($room);
     ensureRoomAccess($room, $room_file);
+    releaseSessionLock();
     try {
         $attachments = parseAttachments($room);
     } catch (Throwable $e) {
@@ -311,6 +318,7 @@ if ($type === 'send') {
 }
 
 if ($type === 'new') {
+    releaseSessionLock();
     $newroom  = strtoupper(bin2hex(random_bytes(5)));
     $pw_input = $_POST['password'] ?? null;
     $gen_pw   = newRoom($newroom, $pw_input ?: null);
@@ -342,6 +350,8 @@ if ($room === 'default') {
         $requireAuth = true;
     }
 }
+
+releaseSessionLock();
 
 $room_data = readJsonFile($room_file, []);
 unset($room_data['list']);
