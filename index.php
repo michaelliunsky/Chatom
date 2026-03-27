@@ -242,16 +242,7 @@ if ($type === 'get') {
     $room_file_get = getRoomFile($room);
     ensureRoomAccess($room, $room_file_get);
     releaseSessionLock();
-    $msg_list = [];
-    if (strpos($_SERVER['SERVER_SOFTWARE'] ?? '', 'nginx') !== false) {
-        $msg_list = getMsg($room, $last_id);
-    } else {
-        for ($i = 0; $i < 20; $i++) {
-            $msg_list = getMsg($room, $last_id);
-            if (!empty($msg_list)) break;
-            usleep(500000);
-        }
-    }
+    $msg_list = getMsg($room, $last_id);
     chatJson(['result' => 'ok', 'list' => $msg_list]);
 }
 
