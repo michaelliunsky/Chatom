@@ -1,19 +1,17 @@
 <?php
 // 单页面在线聊天
-// 20250123 20260315 20260321 BY MKLIU
+// 20250123 20260315 20260321 20260925 BY MKLIU
 include 'config.php';
 date_default_timezone_set("PRC");
 error_reporting(E_ALL & ~E_NOTICE);
 set_time_limit(30);
 if (session_status() !== PHP_SESSION_ACTIVE) session_start();
-ob_start();
 
-$room = preg_replace('/[^a-zA-Z0-9_\-]/', '', $_REQUEST['room'] ?? 'default');
+$room = preg_replace('/[^a-zA-Z0-9_\-]/', '', (string)($_GET['room'] ?? $_POST['room'] ?? 'default'));
 if ($room === '') $room = 'default';
-$type = strtolower($_REQUEST['type'] ?? 'enter');
+$type = strtolower((string)($_GET['type'] ?? $_POST['type'] ?? 'enter'));
 
 function chatJson($payload) {
-    while (ob_get_level() > 0) ob_end_clean();
     header('Content-Type: application/json');
     echo json_encode($payload, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
     exit;
@@ -24,15 +22,37 @@ function releaseSessionLock() {
 }
 
 function readJsonFile($path, $default = []) {
-    if (!file_exists($path)) return $default;
-    $raw = file_get_contents($path);
-    if ($raw === false || $raw === '') return $default;
-    $data = json_decode($raw, true);
+    if (!is_file($path)) return $default;
+    $data = json_decode((string)file_get_contents($path), true);
     return is_array($data) ? $data : $default;
 }
 
 function writeJsonFile($path, $data) {
-    file_put_contents($path, json_encode($data, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES), LOCK_EX);
+    file_put_contents(
+        $path,
+        json_encode($data, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES),
+        LOCK_EX
+    );
+}
+
+function mutateJsonFile($path, callable $fn, $default = []) {
+    $fp = fopen($path, 'c+');
+    if (!$fp) throw new RuntimeException('无法打开数据文件');
+    try {
+        if (!flock($fp, LOCK_EX)) throw new RuntimeException('无法锁定数据文件');
+        $data = json_decode((string)stream_get_contents($fp), true);
+        if (!is_array($data)) $data = $default;
+        $data = $fn($data);
+        if (!is_array($data)) $data = $default;
+        ftruncate($fp, 0);
+        rewind($fp);
+        fwrite($fp, json_encode($data, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES));
+        fflush($fp);
+        return $data;
+    } finally {
+        @flock($fp, LOCK_UN);
+        fclose($fp);
+    }
 }
 
 function getRoomFile($room) {
@@ -49,12 +69,11 @@ function hasRoomAccess($room) {
 
 function grantRoomAccess($room) {
     if ($room === 'default') return;
-    if (!isset($_SESSION['chat_rooms']) || !is_array($_SESSION['chat_rooms'])) $_SESSION['chat_rooms'] = [];
     $_SESSION['chat_rooms'][$room] = true;
 }
 
 function ensureRoomAccess($room, $room_file, $asJson = true) {
-    if (!file_exists($room_file)) {
+    if (!is_file($room_file)) {
         if ($asJson) chatJson(['result' => 'error', 'msg' => 'room not found']);
         http_response_code(404);
         exit('Not found');
@@ -63,18 +82,14 @@ function ensureRoomAccess($room, $room_file, $asJson = true) {
     $roomData = readJsonFile($room_file, []);
     if (empty($roomData['password']) || hasRoomAccess($room)) return $roomData;
 
-    if ($asJson) {
-        http_response_code(403);
-        chatJson(['result' => 'error', 'msg' => 'forbidden']);
-    }
-
     http_response_code(403);
+    if ($asJson) chatJson(['result' => 'error', 'msg' => 'forbidden']);
     exit('Forbidden');
 }
 
 function ensureUploadDir($room) {
     $dir = getUploadDir($room);
-    if (!is_dir($dir) && !@mkdir($dir, 0777, true) && !is_dir($dir)) {
+    if (!is_dir($dir) && !@mkdir($dir, 0755, true) && !is_dir($dir)) {
         throw new RuntimeException('上传目录创建失败');
     }
     return $dir;
@@ -88,8 +103,7 @@ function normalizeFileName($name) {
 }
 
 function mimeFromExtension($name) {
-    $ext = strtolower(pathinfo($name, PATHINFO_EXTENSION));
-    $map = [
+    static $map = [
         'jpg' => 'image/jpeg',
         'jpeg' => 'image/jpeg',
         'png' => 'image/png',
@@ -111,7 +125,7 @@ function mimeFromExtension($name) {
         'ppt' => 'application/vnd.ms-powerpoint',
         'pptx' => 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
     ];
-    return $map[$ext] ?? 'application/octet-stream';
+    return $map[strtolower(pathinfo($name, PATHINFO_EXTENSION))] ?? 'application/octet-stream';
 }
 
 function detectMimeType($path, $originalName = '') {
@@ -123,17 +137,14 @@ function detectMimeType($path, $originalName = '') {
             if (is_string($mime) && $mime !== '') return $mime;
         }
     }
-
     if (function_exists('mime_content_type')) {
         $mime = @mime_content_type($path);
         if (is_string($mime) && $mime !== '') return $mime;
     }
-
     if (function_exists('getimagesize')) {
-        $imageInfo = @getimagesize($path);
-        if (!empty($imageInfo['mime'])) return $imageInfo['mime'];
+        $info = @getimagesize($path);
+        if (!empty($info['mime'])) return $info['mime'];
     }
-
     return mimeFromExtension($originalName !== '' ? $originalName : basename($path));
 }
 
@@ -180,12 +191,12 @@ function parseAttachments($room) {
         if (!move_uploaded_file($tmpName, $storedPath)) throw new RuntimeException('附件保存失败');
 
         $files[] = [
-            'name' => $originalName,
-            'stored_name' => $storedName,
-            'mime' => $mime,
-            'size' => $size,
-            'kind' => isImageMime($mime) ? 'image' : 'file',
-            'url' => buildAttachmentUrl($room, $storedName, false),
+            'name'         => $originalName,
+            'stored_name'  => $storedName,
+            'mime'         => $mime,
+            'size'         => $size,
+            'kind'         => isImageMime($mime) ? 'image' : 'file',
+            'url'          => buildAttachmentUrl($room, $storedName, false),
             'download_url' => buildAttachmentUrl($room, $storedName, true),
         ];
     }
@@ -194,10 +205,8 @@ function parseAttachments($room) {
 }
 
 function getChatrooms() {
-    $files = glob('./chat_data/*.txt');
-    $rooms = [];
-    foreach ($files as $f) $rooms[] = basename($f, '.txt');
-    return $rooms;
+    $files = glob('./chat_data/*.txt') ?: [];
+    return array_map(fn($f) => basename($f, '.txt'), $files);
 }
 
 function generateRandomPassword() {
@@ -208,11 +217,11 @@ function generateRandomPassword() {
 }
 
 function newRoom($room, $custompassword = null) {
-    $room_file = getRoomFile($room);
     $key_list  = array_merge(range(48, 57), range(65, 90), range(97, 122), [43, 47, 61]);
     $key1_list = $key_list;
     shuffle($key1_list);
     if ($room !== 'default' && !$custompassword) $custompassword = generateRandomPassword();
+
     $data = [
         'name'     => $room,
         'encode'   => array_combine($key_list, $key1_list),
@@ -220,7 +229,7 @@ function newRoom($room, $custompassword = null) {
         'time'     => date('Y-m-d H:i:s'),
         'password' => ($room === 'default') ? null : password_hash($custompassword, PASSWORD_DEFAULT),
     ];
-    writeJsonFile($room_file, $data);
+    writeJsonFile(getRoomFile($room), $data);
     return $custompassword;
 }
 
@@ -229,26 +238,31 @@ function getMsg($room, $last_id) {
     $data      = readJsonFile($room_file, ['list' => []]);
     $list      = $data['list'] ?? [];
     $del_time  = date('Y-m-d H:i:s', time() - 604800);
-    $cur = array_values(array_filter($list, fn($r) => $r['time'] > $del_time));
+    $cur       = array_values(array_filter($list, fn($r) => ($r['time'] ?? '') > $del_time));
+
     if (count($cur) !== count($list)) {
-        $data['list'] = $cur;
-        writeJsonFile($room_file, $data);
+        mutateJsonFile($room_file, function ($d) use ($del_time) {
+            $d['list'] = array_values(array_filter(
+                $d['list'] ?? [],
+                fn($r) => ($r['time'] ?? '') > $del_time
+            ));
+            return $d;
+        }, ['list' => []]);
     }
-    return array_values(array_filter($cur, fn($r) => $r['id'] > $last_id));
+
+    return array_values(array_filter($cur, fn($r) => ($r['id'] ?? 0) > $last_id));
 }
 
 if ($type === 'get') {
-    $last_id  = (int)($_REQUEST['last_id'] ?? -1);
-    $room_file_get = getRoomFile($room);
-    ensureRoomAccess($room, $room_file_get);
+    $last_id = (int)($_GET['last_id'] ?? -1);
+    ensureRoomAccess($room, getRoomFile($room));
     releaseSessionLock();
-    $msg_list = getMsg($room, $last_id);
-    chatJson(['result' => 'ok', 'list' => $msg_list]);
+    chatJson(['result' => 'ok', 'list' => getMsg($room, $last_id)]);
 }
 
 if ($type === 'asset') {
     $room_file = getRoomFile($room);
-    $file = basename($_REQUEST['file'] ?? '');
+    $file = basename((string)($_GET['file'] ?? ''));
     $path = getUploadDir($room) . '/' . $file;
     $roomData = ensureRoomAccess($room, $room_file, false);
     releaseSessionLock();
@@ -258,7 +272,7 @@ if ($type === 'asset') {
         exit('Not found');
     }
 
-    $download = isset($_REQUEST['download']) && $_REQUEST['download'] === '1';
+    $download = ($_GET['download'] ?? '') === '1';
     $mime = detectMimeType($path, $file);
     $name = $file;
 
@@ -286,25 +300,31 @@ if ($type === 'send') {
     $room_file = getRoomFile($room);
     ensureRoomAccess($room, $room_file);
     releaseSessionLock();
+
     try {
         $attachments = parseAttachments($room);
     } catch (Throwable $e) {
         chatJson(['result' => 'error', 'msg' => $e->getMessage()]);
     }
-    $content = $_REQUEST['content'] ?? '';
+
+    $content = (string)($_POST['content'] ?? '');
     if (trim($content) === '' && empty($attachments)) {
         chatJson(['result' => 'error', 'msg' => 'empty message']);
     }
+
     $item = [
         'id'          => round(microtime(true) * 1000),
-        'user'        => trim(substr($_REQUEST['user'] ?? 'anon', 0, 50)) ?: 'anon',
+        'user'        => trim(substr((string)($_POST['user'] ?? 'anon'), 0, 50)) ?: 'anon',
         'content'     => $content,
         'time'        => date('Y-m-d H:i:s'),
         'attachments' => $attachments,
     ];
-    $data           = readJsonFile($room_file, ['list' => []]);
-    $data['list'][] = $item;
-    writeJsonFile($room_file, $data);
+
+    mutateJsonFile($room_file, function ($data) use ($item) {
+        $data['list'][] = $item;
+        return $data;
+    }, ['list' => []]);
+
     chatJson(['result' => 'ok']);
 }
 
@@ -322,14 +342,15 @@ $requireAuth = false;
 $authError   = '';
 
 if ($room === 'default') {
-    if (!file_exists($room_file)) newRoom($room);
+    if (!is_file($room_file)) newRoom($room);
 } else {
-    if (!file_exists($room_file)) { header('Location: index.php'); exit; }
-    $room_data_tmp = readJsonFile($room_file, []);
+    if (!is_file($room_file)) { header('Location: index.php'); exit; }
+
     if (hasRoomAccess($room)) {
         $requireAuth = false;
     } elseif ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['auth_submit'])) {
-        $input_pw = $_POST['password'] ?? '';
+        $room_data_tmp = readJsonFile($room_file, []);
+        $input_pw      = (string)($_POST['password'] ?? '');
         if (!password_verify($input_pw, $room_data_tmp['password'] ?? '')) {
             $requireAuth = true;
             $authError   = '密码错误';
@@ -344,10 +365,13 @@ if ($room === 'default') {
 
 releaseSessionLock();
 
-$room_data = readJsonFile($room_file, []);
-unset($room_data['list']);
+$room_data_full = readJsonFile($room_file, []);
+$room_data = [
+    'name'   => $room_data_full['name'] ?? $room,
+    'encode' => $room_data_full['encode'] ?? [],
+];
 
-$user      = 'User' . str_pad((time() % 99 + 1), 2, '0', STR_PAD_LEFT);
+$user      = sprintf('User%02d', time() % 99 + 1);
 $chatrooms = getChatrooms();
 ?>
 <!DOCTYPE html>
@@ -378,9 +402,31 @@ $chatrooms = getChatrooms();
   --h-btn: 32px;
 }
 
-html, body { height: 100dvh; background: var(--c0); color: var(--c7); font-family: var(--sans); font-size: 15px; overflow: hidden; -webkit-font-smoothing: antialiased; }
+html, body {
+  height: 100dvh; background: var(--c0); color: var(--c7);
+  font-family: var(--sans); font-size: 15px; overflow: hidden;
+  -webkit-font-smoothing: antialiased;
+}
 
 .layout { display: grid; grid-template-columns: var(--sw) 1fr; height: 100dvh; }
+
+.btn-o {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  height: var(--h-btn);
+  padding: 0 12px;
+  border: 1px solid var(--c3);
+  border-radius: var(--r-btn);
+  background: transparent;
+  color: var(--c5);
+  font-size: 12px;
+  font-family: var(--sans);
+  cursor: pointer;
+  text-decoration: none;
+  transition: color .15s, border-color .15s, background .15s;
+}
+.btn-o:hover { color: var(--c7); border-color: var(--c6); }
 
 /* Sidebar */
 .side {
@@ -395,20 +441,10 @@ html, body { height: 100dvh; background: var(--c0); color: var(--c7); font-famil
   flex-shrink: 0;
 }
 
-.site-name {
-  font-size: 13px;
-  font-weight: 600;
-  color: var(--c7);
-  letter-spacing: -.2px;
-}
+.site-name { font-size: 13px; font-weight: 600; color: var(--c7); letter-spacing: -.2px; }
 
 .nick-row { margin-top: 10px; }
-
-.nick-label {
-  font-size: 11px;
-  color: var(--c5);
-  margin-bottom: 4px;
-}
+.nick-label { font-size: 11px; color: var(--c5); margin-bottom: 4px; }
 
 .nick-input {
   width: 100%;
@@ -424,10 +460,7 @@ html, body { height: 100dvh; background: var(--c0); color: var(--c7); font-famil
 }
 .nick-input:focus { border-color: var(--c6); }
 
-.side-rooms {
-  flex: 1; overflow-y: auto; min-height: 0;
-  padding: 8px 8px 10px;
-}
+.side-rooms { flex: 1; overflow-y: auto; min-height: 0; padding: 8px 8px 10px; }
 .side-rooms::-webkit-scrollbar { width: 3px; }
 .side-rooms::-webkit-scrollbar-thumb { background: var(--c3); }
 
@@ -437,29 +470,21 @@ html, body { height: 100dvh; background: var(--c0); color: var(--c7); font-famil
   color: var(--c4);
   border-top: 1px solid var(--c3);
   flex-shrink: 0;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
+.side-footer a { color: var(--c5); text-decoration: none; }
 
 .side-close {
   display: none;
-  background: none;
-  border: none;
-  font-size: 18px;
-  line-height: 1;
-  color: var(--c5);
-  cursor: pointer;
+  background: none; border: none;
+  font-size: 18px; line-height: 1;
+  color: var(--c5); cursor: pointer;
   padding: 0 2px;
   transition: color .15s;
 }
 .side-close:hover { color: var(--c7); }
 
-.rooms-label {
-  font-size: 11px;
-  color: var(--c5);
-  padding: 4px 6px 6px;
-}
+.rooms-label { font-size: 11px; color: var(--c5); padding: 4px 6px 6px; }
 
 .room-link {
   display: flex; align-items: center; justify-content: space-between;
@@ -475,7 +500,6 @@ html, body { height: 100dvh; background: var(--c0); color: var(--c7); font-famil
 }
 .room-link:hover { background: var(--c2); color: var(--c7); }
 .room-link.on { background: var(--c7); color: var(--c0); }
-
 .room-lock { font-size: 11px; opacity: .5; }
 
 .add-room {
@@ -489,8 +513,8 @@ html, body { height: 100dvh; background: var(--c0); color: var(--c7); font-famil
   color: var(--c5);
   cursor: pointer;
   text-align: left;
-  transition: color .15s, border-color .15s;
   font-family: var(--sans);
+  transition: color .15s, border-color .15s;
 }
 .add-room:hover { color: var(--c7); border-color: var(--c6); }
 
@@ -507,19 +531,6 @@ html, body { height: 100dvh; background: var(--c0); color: var(--c7); font-famil
 .topbar-room { font-size: 13px; font-weight: 600; font-family: var(--mono); }
 .topbar-meta { font-size: 11px; color: var(--c5); margin-left: 8px; font-weight: 400; font-family: var(--sans); }
 
-.clear-btn {
-  height: var(--h-btn);
-  padding: 0 12px;
-  border: 1px solid var(--c3);
-  border-radius: var(--r-btn);
-  background: transparent;
-  font-size: 12px;
-  color: var(--c5);
-  cursor: pointer;
-  transition: color .15s, border-color .15s;
-}
-.clear-btn:hover { color: var(--c7); border-color: var(--c6); }
-
 .icon-btn {
   display: inline-flex;
   align-items: center;
@@ -530,6 +541,8 @@ html, body { height: 100dvh; background: var(--c0); color: var(--c7); font-famil
   line-height: 1;
   font-size: 16px;
 }
+
+#menuBtn { display: none; }
 
 /* Messages */
 .msgs {
@@ -561,28 +574,10 @@ html, body { height: 100dvh; background: var(--c0); color: var(--c7); font-famil
 }
 
 .msg-right { min-width: 0; }
+.msg-time { font-size: 11px; color: var(--c4); font-family: var(--mono); margin-bottom: 2px; }
+.msg-text { font-size: 13.5px; line-height: 1.6; color: var(--c6); word-break: break-word; }
 
-.msg-time {
-  font-size: 11px;
-  color: var(--c4);
-  font-family: var(--mono);
-  margin-bottom: 2px;
-}
-
-.msg-text {
-  font-size: 13.5px;
-  line-height: 1.6;
-  color: var(--c6);
-  word-break: break-word;
-}
-
-.msg-media {
-  display: grid;
-  gap: 8px;
-  margin-top: 8px;
-  width: min(560px, 100%);
-}
-
+.msg-media { display: grid; gap: 8px; margin-top: 8px; width: min(560px, 100%); }
 .msg-image {
   display: block;
   max-width: min(320px, 100%);
@@ -592,51 +587,23 @@ html, body { height: 100dvh; background: var(--c0); color: var(--c7); font-famil
 }
 
 .msg-file {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
+  display: flex; align-items: center; justify-content: space-between;
   gap: 12px;
   padding: 10px 12px;
   border: 1px solid var(--c3);
   border-radius: 10px;
   background: var(--c1);
 }
-
-.msg-file-meta {
-  min-width: 0;
-}
-
-.msg-file-name {
-  font-size: 13px;
-  color: var(--c7);
-  font-weight: 600;
-  word-break: break-word;
-}
-
-.msg-file-size {
-  margin-top: 2px;
-  font-size: 11px;
-  color: var(--c5);
-  font-family: var(--mono);
-}
+.msg-file-meta { min-width: 0; }
+.msg-file-name { font-size: 13px; color: var(--c7); font-weight: 600; word-break: break-word; }
+.msg-file-size { margin-top: 2px; font-size: 11px; color: var(--c5); font-family: var(--mono); }
 
 .file-download {
   flex-shrink: 0;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  min-width: 72px;
-  height: var(--h-btn);
-  padding: 0 12px;
-  border: 1px solid var(--c3);
-  border-radius: var(--r-btn);
   color: var(--c7);
-  text-decoration: none;
-  font-size: 12px;
-  transition: border-color .15s, background .15s;
   background: var(--c0);
 }
-.file-download:hover { border-color: var(--c6); background: var(--c2); }
+.file-download:hover { background: var(--c2); }
 
 .no-msgs {
   display: flex; align-items: center; justify-content: center;
@@ -652,25 +619,17 @@ html, body { height: 100dvh; background: var(--c0); color: var(--c7); font-famil
   flex-shrink: 0;
 }
 
-.input-row {
-  display: block;
-}
-
 .composer {
-  flex: 1;
-  min-width: 0;
   border: 1px solid var(--c3);
   border-radius: 8px;
   background: var(--c0);
   padding: 10px 12px;
   transition: border-color .15s, background .15s, box-shadow .15s;
 }
-
 .composer:focus-within {
   border-color: var(--c6);
   box-shadow: 0 0 0 3px rgba(17,17,16,.03);
 }
-
 .composer.drag-on {
   border-color: var(--c6);
   background: var(--c1);
@@ -679,9 +638,7 @@ html, body { height: 100dvh; background: var(--c0); color: var(--c7); font-famil
 
 #txtContent {
   width: 100%;
-  border: none;
-  border-radius: 0;
-  padding: 0;
+  border: none; padding: 0;
   font-size: 14px;
   font-family: var(--sans);
   color: var(--c7);
@@ -694,55 +651,29 @@ html, body { height: 100dvh; background: var(--c0); color: var(--c7); font-famil
 }
 #txtContent::placeholder { color: var(--c4); }
 
-.attach-list {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-  margin-top: 8px;
-}
-
-.attach-list:empty {
-  display: none;
-}
+.attach-list { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+.attach-list:empty { display: none; }
 
 .pick-btn {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  height: var(--h-btn);
-  padding: 0 12px;
-  border: 1px solid var(--c3);
-  border-radius: var(--r-btn);
   background: var(--c1);
   color: var(--c6);
-  font-size: 12px;
-  cursor: pointer;
-  transition: color .15s, border-color .15s, background .15s;
 }
-.pick-btn:hover { color: var(--c7); border-color: var(--c6); background: var(--c2); }
+.pick-btn:hover { background: var(--c2); }
 
 .pick-input { display: none; }
 
 .composer-footer {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
+  display: flex; align-items: center; justify-content: space-between;
   gap: 12px;
   margin-top: 6px;
   padding-top: 6px;
   border-top: 1px solid var(--c2);
 }
 
-.composer-actions {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  margin-left: auto;
-}
+.composer-actions { display: flex; align-items: center; gap: 8px; margin-left: auto; }
 
 .attach-chip {
-  display: inline-flex;
-  align-items: center;
+  display: inline-flex; align-items: center;
   gap: 8px;
   max-width: 100%;
   padding: 5px 8px;
@@ -752,57 +683,46 @@ html, body { height: 100dvh; background: var(--c0); color: var(--c7); font-famil
   font-size: 12px;
   color: var(--c6);
 }
-
 .attach-chip-name {
   max-width: 240px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-
 .attach-chip-remove {
-  border: none;
-  background: transparent;
+  border: none; background: transparent;
   color: var(--c5);
-  font-size: 14px;
-  line-height: 1;
-  cursor: pointer;
-  padding: 0;
+  font-size: 14px; line-height: 1;
+  cursor: pointer; padding: 0;
 }
 .attach-chip-remove:hover { color: var(--red); }
 
 .drop-hint {
-  display: block;
-  flex: 1;
-  min-width: 0;
+  display: block; flex: 1; min-width: 0;
   color: var(--c5);
   font-size: 11px;
   line-height: 1.45;
   min-height: 16px;
   transition: color .18s, opacity .18s;
 }
-
-.composer.drag-on .drop-hint {
-  color: var(--c6);
-}
+.composer.drag-on .drop-hint { color: var(--c6); }
 
 .send {
-  height: var(--h-btn); padding: 0 12px;
+  height: var(--h-btn);
+  padding: 0 12px;
   background: var(--c7);
-  border: none; border-radius: var(--r-btn);
+  border: none;
+  border-radius: var(--r-btn);
   color: var(--c0);
-  font-size: 12px; font-weight: 600;
+  font-size: 12px;
+  font-weight: 600;
   cursor: pointer;
   flex-shrink: 0;
   transition: background .15s, transform .15s;
 }
 .send:hover { background: var(--c6); }
 .send:active { transform: translateY(1px); }
-.send:disabled {
-  cursor: default;
-  background: var(--c5);
-  transform: none;
-}
+.send:disabled { cursor: default; background: var(--c5); transform: none; }
 
 .input-hint {
   margin-top: 9px;
@@ -835,8 +755,7 @@ html, body { height: 100dvh; background: var(--c0); color: var(--c7); font-famil
 .veil.on .panel { transform: translateY(0); }
 
 .panel-title { font-size: 15px; font-weight: 600; margin-bottom: 4px; }
-.panel-sub   { font-size: 12px; color: var(--c5); margin-bottom: 18px; line-height: 1.6; }
-
+.panel-sub { font-size: 12px; color: var(--c5); margin-bottom: 18px; line-height: 1.6; }
 .field-label { font-size: 11px; color: var(--c5); margin-bottom: 4px; }
 
 .field {
@@ -857,10 +776,15 @@ html, body { height: 100dvh; background: var(--c0); color: var(--c7); font-famil
 .panel-row { display: flex; gap: 8px; }
 
 .btn-dark {
-  flex: 1; min-height: 38px; padding: 8px 14px;
-  background: var(--c7); border: none; border-radius: var(--r-btn);
-  color: var(--c0); font-size: 13px; font-weight: 500;
-  cursor: pointer; transition: background .15s;
+  flex: 1;
+  min-height: 38px;
+  padding: 8px 14px;
+  background: var(--c7); border: none;
+  border-radius: var(--r-btn);
+  color: var(--c0);
+  font-size: 13px; font-weight: 500;
+  cursor: pointer;
+  transition: background .15s;
 }
 .btn-dark:hover { background: var(--c6); }
 
@@ -868,20 +792,23 @@ html, body { height: 100dvh; background: var(--c0); color: var(--c7); font-famil
   min-height: 38px;
   padding: 8px 14px;
   background: transparent;
-  border: 1px solid var(--c3); border-radius: var(--r-btn);
-  color: var(--c5); font-size: 13px;
-  cursor: pointer; transition: color .15s, border-color .15s;
+  border: 1px solid var(--c3);
+  border-radius: var(--r-btn);
+  color: var(--c5);
+  font-size: 13px;
+  cursor: pointer;
+  transition: color .15s, border-color .15s;
 }
 .btn-line:hover { color: var(--c7); border-color: var(--c6); }
 
 .result-block {
-  background: var(--c1); border: 1px solid var(--c3);
-  border-radius: 5px; padding: 10px 12px; margin-bottom: 16px;
+  background: var(--c1);
+  border: 1px solid var(--c3);
+  border-radius: 5px;
+  padding: 10px 12px;
+  margin-bottom: 16px;
 }
-.result-item {
-  display: flex; justify-content: space-between; align-items: center;
-  padding: 3px 0; gap: 12px;
-}
+.result-item { display: flex; justify-content: space-between; align-items: center; padding: 3px 0; gap: 12px; }
 .rk { font-size: 11px; color: var(--c5); flex-shrink: 0; }
 .rv { font-size: 13px; font-weight: 600; font-family: var(--mono); color: var(--c7); word-break: break-all; text-align: right; }
 
@@ -903,24 +830,26 @@ html, body { height: 100dvh; background: var(--c0); color: var(--c7); font-famil
 }
 
 .auth-title { font-size: 15px; font-weight: 600; margin-bottom: 4px; }
-.auth-sub   { font-size: 12px; color: var(--c5); margin-bottom: 20px; line-height: 1.6; }
-.auth-err   { font-size: 12px; color: var(--red); margin-bottom: 10px; }
+.auth-sub { font-size: 12px; color: var(--c5); margin-bottom: 20px; line-height: 1.6; }
+.auth-err { font-size: 12px; color: var(--red); margin-bottom: 10px; }
 
 /* Toast */
 .toasts {
   position: fixed; bottom: 18px; right: 18px;
-  z-index: 999; display: flex; flex-direction: column; gap: 6px; align-items: flex-end;
+  z-index: 999;
+  display: flex; flex-direction: column; gap: 6px; align-items: flex-end;
 }
 .toast {
   background: var(--c7); color: var(--c0);
-  border-radius: 5px; padding: 8px 14px;
+  border-radius: 5px;
+  padding: 8px 14px;
   font-size: 12px;
   box-shadow: 0 4px 14px rgba(0,0,0,.15);
   animation: tin .15s ease-out;
 }
 .toast.err { background: var(--red); }
-@keyframes tin  { from { opacity:0; transform:translateY(6px); } }
-@keyframes tout { to   { opacity:0; transform:translateY(6px); } }
+@keyframes tin { from { opacity:0; transform:translateY(6px); } }
+@keyframes tout { to { opacity:0; transform:translateY(6px); } }
 
 .side-overlay {
   display: none;
@@ -932,11 +861,20 @@ html, body { height: 100dvh; background: var(--c0); color: var(--c7); font-famil
 /* Mobile */
 @media (max-width: 600px) {
   .layout { grid-template-columns: 1fr; }
-  .side { display:none; position:fixed; inset:0 auto 0 0; width:var(--sw); z-index:60; box-shadow:4px 0 16px rgba(0,0,0,.1); }
-  .side.open { display:flex; }
-  .side.open ~ .side-overlay { display:block; }
-  .side-close { display:block; }
-  #menuBtn { display:flex !important; }
+  .side {
+    display: none;
+    position: fixed; inset: 0 auto 0 0;
+    width: var(--sw);
+    z-index: 60;
+    box-shadow: 4px 0 16px rgba(0,0,0,.1);
+  }
+  .side.open { display: flex; }
+  .side.open ~ .side-overlay { display: block; }
+  .side-close { display: block; }
+  #menuBtn { display: flex; }
+  .composer-footer { flex-direction: column; align-items: stretch; }
+  .composer-actions { width: 100%; justify-content: space-between; }
+  .attach-list, .drop-hint { width: 100%; }
 }
 
 /* Desktop — bump everything up */
@@ -951,7 +889,8 @@ html, body { height: 100dvh; background: var(--c0); color: var(--c7); font-famil
   .topbar      { height: 52px; padding: 0 20px; }
   .topbar-room { font-size: 15px; }
   .topbar-meta { font-size: 13px; }
-  .clear-btn   { font-size: 13px; padding: 0 14px; }
+  .btn-o       { font-size: 13px; padding: 0 14px; }
+  .pick-btn, .file-download { height: 34px; }
   .msgs        { padding: 16px 20px; }
   .msg         { padding: 6px 0; gap: 0 12px; }
   .msg-who     { font-size: 14px; min-width: 90px; max-width: 140px; }
@@ -960,10 +899,8 @@ html, body { height: 100dvh; background: var(--c0); color: var(--c7); font-famil
   .msg-file-name { font-size: 14px; }
   .no-msgs     { font-size: 14px; }
   .input-area  { padding: 12px 18px 16px; }
-  #txtContent  { font-size: 15px; padding: 0; }
+  #txtContent  { font-size: 15px; }
   .send        { font-size: 13px; height: 34px; padding: 0 14px; }
-  .pick-btn    { font-size: 13px; height: 34px; padding: 0 14px; }
-  .file-download { font-size: 13px; height: 34px; }
   .input-hint  { font-size: 12px; }
   .drop-hint   { font-size: 12px; }
   .panel-title { font-size: 16px; }
@@ -975,27 +912,6 @@ html, body { height: 100dvh; background: var(--c0); color: var(--c7); font-famil
   .auth-sub    { font-size: 13px; }
   .auth-err    { font-size: 13px; }
   .toast       { font-size: 13px; }
-}
-
-@media (max-width: 600px) {
-  #menuBtn {
-    align-items: center;
-    justify-content: center;
-  }
-  .composer-footer {
-    flex-direction: column;
-    align-items: stretch;
-  }
-  .composer-actions {
-    width: 100%;
-    justify-content: space-between;
-  }
-  .attach-list {
-    width: 100%;
-  }
-  .drop-hint {
-    width: 100%;
-  }
 }
 </style>
 </head>
@@ -1043,15 +959,13 @@ html, body { height: 100dvh; background: var(--c0); color: var(--c7); font-famil
         <a class="room-link <?= ($cr === $room_data['name']) ? 'on' : '' ?>"
            href="index.php?room=<?= urlencode($cr) ?>">
           <span><?= htmlspecialchars($cr) ?></span>
-          <?php if ($cr !== 'default'): ?>
-            <span class="room-lock">🔒</span>
-          <?php endif; ?>
+          <?php if ($cr !== 'default'): ?><span class="room-lock">🔒</span><?php endif; ?>
         </a>
       <?php endforeach; ?>
       <button class="add-room" onclick="openCreate()">+ 新建房间</button>
     </div>
     <div class="side-footer">
-      © 2025-2026 <a href="https://www.mkliu.top/" style="color:var(--c5);text-decoration:none">michaelliunsky</a> & Yuer6327
+      © 2025-2026 <a href="https://www.mkliu.top/">michaelliunsky</a> & Yuer6327
     </div>
   </aside>
   <div class="side-overlay" id="sideOverlay" onclick="closeSide()"></div>
@@ -1059,12 +973,12 @@ html, body { height: 100dvh; background: var(--c0); color: var(--c7); font-famil
   <section class="main">
     <div class="topbar">
       <div style="display:flex;align-items:center;gap:8px">
-        <button class="clear-btn icon-btn" id="menuBtn" style="display:none"
+        <button class="btn-o icon-btn" id="menuBtn"
                 onclick="document.getElementById('side').classList.toggle('open')">☰</button>
         <span class="topbar-room"><?= htmlspecialchars($room_data['name']) ?></span>
         <span class="topbar-meta"><?= date('Y-m-d') ?></span>
       </div>
-      <button class="clear-btn" onclick="clearMsgs()">清屏</button>
+      <button class="btn-o" onclick="clearMsgs()">清屏</button>
     </div>
 
     <div class="msgs" id="msgs">
@@ -1072,17 +986,15 @@ html, body { height: 100dvh; background: var(--c0); color: var(--c7); font-famil
     </div>
 
     <div class="input-area">
-      <div class="input-row">
-        <div class="composer">
-          <textarea id="txtContent" rows="1" placeholder="输入消息 / 添加附件 / 拖拽 / 粘贴"></textarea>
-          <div class="attach-list" id="attachList"></div>
-          <div class="composer-footer">
-            <div class="drop-hint" id="dropHint">添加附件 / 拖拽 / 粘贴 / 10MB 内</div>
-            <div class="composer-actions">
-              <label class="pick-btn" for="fileInput">添加附件</label>
-              <input id="fileInput" class="pick-input" type="file" multiple>
-              <button class="send" id="sendBtn" type="button" onclick="sendMsg()">发送</button>
-            </div>
+      <div class="composer">
+        <textarea id="txtContent" rows="1" placeholder="输入消息 / 添加附件 / 拖拽 / 粘贴"></textarea>
+        <div class="attach-list" id="attachList"></div>
+        <div class="composer-footer">
+          <div class="drop-hint" id="dropHint">添加附件 / 拖拽 / 粘贴 / 10MB 内</div>
+          <div class="composer-actions">
+            <label class="btn-o pick-btn" for="fileInput">添加附件</label>
+            <input id="fileInput" class="pick-input" type="file" multiple>
+            <button class="send" id="sendBtn" type="button" onclick="sendMsg()">发送</button>
           </div>
         </div>
       </div>
@@ -1125,7 +1037,7 @@ html, body { height: 100dvh; background: var(--c0); color: var(--c7); font-famil
 <div class="toasts" id="toasts"></div>
 
 <script id="wk" type="app/worker">
-var room='<?= $room_data['name'] ?>',busy=false,lastId=-1,base='';
+var room='<?= htmlspecialchars($room_data['name'], ENT_QUOTES) ?>',busy=false,lastId=-1,base='';
 addEventListener('message',function(e){base=e.data;});
 setInterval(function(){
   if(busy)return;busy=true;
@@ -1149,13 +1061,13 @@ function toast(msg,type){
 }
 
 <?php if (!$requireAuth): ?>
-var R=<?= json_encode($room_data) ?>;
+var R=<?= json_encode($room_data, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES) ?>;
 R.dec={};
 for(var k in R.encode) R.dec[R.encode[k]]=k;
 
 function enc(s){s=encodeURIComponent(s);s=btoa(s);var o='';for(var i=0;i<s.length;i++)o+=String.fromCharCode(R.encode[s.charCodeAt(i)]);return o;}
 function dec(s){var o='';for(var i=0;i<s.length;i++)o+=String.fromCharCode(R.dec[s.charCodeAt(i)]);return decodeURIComponent(atob(o));}
-function esc(s){return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
 function escAttr(s){return esc(s).replace(/"/g,'&quot;');}
 function fmtText(s){return esc(s).replace(/\n/g,'<br>');}
 function fmtSize(size){
@@ -1163,10 +1075,7 @@ function fmtSize(size){
   if(size<1024*1024)return (size/1024).toFixed(size<10240?1:0)+' KB';
   return (size/1024/1024).toFixed(size<10*1024*1024?1:0)+' MB';
 }
-function fileIcon(kind){return kind==='image'?'图片':'文件';}
-function hintText(text){
-  document.getElementById('dropHint').textContent=text;
-}
+function hintText(text){document.getElementById('dropHint').textContent=text;}
 
 var wk=new Worker(URL.createObjectURL(new Blob([document.getElementById('wk').textContent])));
 var seen={};
@@ -1198,9 +1107,9 @@ function buildMsg(r){
       return '<div class="msg-file">'
         +'<div class="msg-file-meta">'
         +'<div class="msg-file-name">'+esc(file.name||'file')+'</div>'
-        +'<div class="msg-file-size">'+fileIcon(file.kind)+' · '+fmtSize(Number(file.size)||0)+'</div>'
+        +'<div class="msg-file-size">文件 · '+fmtSize(Number(file.size)||0)+'</div>'
         +'</div>'
-        +'<a class="file-download" href="'+escAttr(file.download_url||file.url)+'" download>下载</a>'
+        +'<a class="btn-o file-download" href="'+escAttr(file.download_url||file.url)+'" download>下载</a>'
         +'</div>';
     }).join('')+'</div>';
   }
@@ -1217,6 +1126,7 @@ function buildMsg(r){
 
 var lastSend=0;
 var sending=false;
+
 function setComposerDrag(on){
   composer.classList.toggle('drag-on',!!on);
   updateInputHint();
@@ -1229,7 +1139,7 @@ function setSending(on){
 }
 
 function addPickedFiles(next){
-  next=(next||[]).filter(function(file){return file&&file.size>=0;});
+  next=(next||[]).filter(Boolean);
   if(!next.length)return false;
   if(pickedFiles.length+next.length>6){
     toast('一次最多发送 6 个附件','err');
@@ -1242,8 +1152,7 @@ function addPickedFiles(next){
 }
 
 function renderAttachList(){
-  var el=document.getElementById('attachList');
-  el.innerHTML=pickedFiles.map(function(file,idx){
+  document.getElementById('attachList').innerHTML=pickedFiles.map(function(file,idx){
     return '<div class="attach-chip">'
       +'<span class="attach-chip-name">'+esc(file.name)+'</span>'
       +'<button class="attach-chip-remove" type="button" onclick="removePickedFile('+idx+')">×</button>'
@@ -1265,9 +1174,7 @@ function clearPickedFiles(){
 }
 
 function filesFromDataTransfer(dt){
-  if(!dt)return [];
-  if(dt.files&&dt.files.length)return Array.prototype.slice.call(dt.files);
-  return [];
+  return dt && dt.files ? Array.from(dt.files) : [];
 }
 
 function filesFromClipboard(e){
@@ -1283,26 +1190,16 @@ function filesFromClipboard(e){
     });
   }
   if(!files.length&&cd.files&&cd.files.length){
-    files=Array.prototype.slice.call(cd.files);
+    files=Array.from(cd.files);
   }
   return files;
 }
 
 function updateInputHint(){
   var txt=ta.value.trim();
-  var dragging=composer.classList.contains('drag-on');
-  if(dragging){
-    hintText('松手添加');
-    return;
-  }
-  if(pickedFiles.length){
-    hintText('已选 '+pickedFiles.length+' 个附件 / 可继续输入');
-    return;
-  }
-  if(txt){
-    hintText('可继续添加附件 / 拖拽 / 粘贴');
-    return;
-  }
+  if(composer.classList.contains('drag-on')){hintText('松手添加');return;}
+  if(pickedFiles.length){hintText('已选 '+pickedFiles.length+' 个附件 / 可继续输入');return;}
+  if(txt){hintText('可继续添加附件 / 拖拽 / 粘贴');return;}
   hintText('添加附件 / 拖拽 / 粘贴 / 10MB 内');
 }
 
@@ -1322,10 +1219,8 @@ function sendMsg(){
   body.append('user',user);
   body.append('content',txt?enc(rawTxt):'');
   pickedFiles.forEach(function(file){body.append('attachments[]',file,file.name);});
-  fetch('index.php?type=send',{
-    method:'POST',
-    body:body
-  }).then(function(r){return r.text();})
+  fetch('index.php?type=send',{method:'POST',body:body})
+    .then(function(r){return r.text();})
     .then(function(text){
       try{return JSON.parse(text);}
       catch(e){throw new Error(text.indexOf('<')!==-1?'服务器异常 / 请检查 PHP 配置':'发送失败 / 请重试');}
@@ -1349,13 +1244,19 @@ function doCreate(){
   var btn=document.getElementById('createBtn');
   btn.textContent='…';btn.disabled=true;
   fetch('index.php?type=new',{
-    method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},
+    method:'POST',
+    headers:{'Content-Type':'application/x-www-form-urlencoded'},
     body:new URLSearchParams({password:pw})
   })
     .then(function(r){return r.json();})
     .then(function(d){
       btn.textContent='创建';btn.disabled=false;
-      if(d.result==='ok'){newRes=d;closeCreate();document.getElementById('rRoom').textContent=d.room;document.getElementById('rPw').textContent=d.password;document.getElementById('vResult').classList.add('on');}
+      if(d.result==='ok'){
+        newRes=d;closeCreate();
+        document.getElementById('rRoom').textContent=d.room;
+        document.getElementById('rPw').textContent=d.password;
+        document.getElementById('vResult').classList.add('on');
+      }
     })
     .catch(function(){btn.textContent='创建';btn.disabled=false;toast('创建失败 / 请重试','err');});
 }
@@ -1405,21 +1306,23 @@ composer.addEventListener('drop',function(e){
   setComposerDrag(false);
   addPickedFiles(filesFromDataTransfer(e.dataTransfer));
 });
-window.addEventListener('dragover',function(e){
-  if(e.dataTransfer&&Array.prototype.indexOf.call(e.dataTransfer.types||[],'Files')!==-1)e.preventDefault();
-});
-window.addEventListener('drop',function(e){
-  if(e.dataTransfer&&Array.prototype.indexOf.call(e.dataTransfer.types||[],'Files')!==-1)e.preventDefault();
+['dragover','drop'].forEach(function(type){
+  window.addEventListener(type,function(e){
+    if(e.dataTransfer && Array.prototype.indexOf.call(e.dataTransfer.types||[],'Files')!==-1){
+      e.preventDefault();
+    }
+  });
 });
 document.getElementById('fileInput').addEventListener('change',function(e){
-  var next=Array.prototype.slice.call(e.target.files||[]);
+  var next=Array.from(e.target.files||[]);
   if(!next.length)return;
   addPickedFiles(next);
   e.target.value='';
 });
 
 (function(){
-  var s=localStorage.getItem('r_'+R.name);if(s)document.getElementById('txtUser').value=s;
+  var s=localStorage.getItem('r_'+R.name);
+  if(s)document.getElementById('txtUser').value=s;
   resize();
   updateInputHint();
 })();
